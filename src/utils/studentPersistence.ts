@@ -4119,13 +4119,13 @@ export async function fetchStudentHomeworkProgressFromFirestore(
     const hwDocRef = doc(db, 'users', cleanUid, 'homework', targetWeekId);
     const hwSnap = await withFirestoreTimeout(getDoc(hwDocRef), 2500, null);
     if (hwSnap && hwSnap.exists()) {
+      // Requirement 2: If canonical document exists, return its data even when empty or unanswered.
+      // Never consult legacy Week 1 storage when the canonical document exists.
       const data = hwSnap.data();
-      if (data && (data.completedPartsByDay || data.studentAnswers || data.matchingPairs)) {
-        return data as WeeklyHomeworkData;
-      }
+      return (data || {}) as WeeklyHomeworkData;
     }
 
-    // 2. Week 1 backward compatibility only:
+    // 2. Week 1 backward compatibility only (consulted ONLY when canonical document does NOT exist):
     if (targetCycle === 1) {
       // Check legacy subcollection document 'current_week'
       const legacyHwRef = doc(db, 'users', cleanUid, 'homework', 'current_week');
@@ -4214,6 +4214,60 @@ export async function fetchStudentHomeworkProgressFromFirestore(
 }
 
 /**
+ * Creates a clean, initialized homework state for a given student and week cycle.
+ * Ensures answers, completed parts, and completion flags are completely cleared,
+ * while preserving the expected WeeklyHomeworkData structure and UI compatibility.
+ */
+export function createCleanInitializedHomework(
+  studentUid: string,
+  studentEmail?: string,
+  cycle: number = 1,
+  partial?: Partial<WeeklyHomeworkData>
+): WeeklyHomeworkData {
+  const canonicalWeekId = normalizeWeekId(cycle) || `week-${cycle}`;
+  return {
+    id: partial?.id || `hw-${canonicalWeekId}-${studentUid}`,
+    weekId: canonicalWeekId,
+    weeklyCycle: cycle,
+    studentUid,
+    studentEmail: studentEmail || partial?.studentEmail || '',
+    studentName: partial?.studentName || 'Student',
+    studentLevel: partial?.studentLevel || 'intermediate',
+    createdAt: partial?.createdAt || new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    weekLabel: partial?.weekLabel || `Week ${cycle}`,
+    totalWordsCollected: partial?.totalWordsCollected || 0,
+    vocabularyList: Array.isArray(partial?.vocabularyList) ? partial.vocabularyList : [],
+    allRoutineWords: Array.isArray(partial?.allRoutineWords) ? partial.allRoutineWords : [],
+    matchingPairs: Array.isArray(partial?.matchingPairs) ? partial.matchingPairs : [],
+    fillInBlanks: Array.isArray(partial?.fillInBlanks) ? partial.fillInBlanks : [],
+    sentenceWritingPrompts: Array.isArray(partial?.sentenceWritingPrompts) ? partial.sentenceWritingPrompts : [],
+    readingPassage: partial?.readingPassage || {
+      title: `Week ${cycle} Reading`,
+      text: '',
+      questions: [],
+    },
+    targetDay: partial?.targetDay,
+    assignedPart: partial?.assignedPart,
+    assignedPartKey: partial?.assignedPartKey,
+    // Explicitly clean / empty answers and completion state
+    isCompleted: false,
+    isDayPartCompleted: false,
+    score: 0,
+    completedPartsByDay: {},
+    studentAnswers: {
+      matching: {},
+      fillInBlanks: {},
+      sentences: {},
+      quizAnswers: {},
+    },
+    isEmpty: partial?.isEmpty !== undefined ? partial.isEmpty : true,
+    emptyWarning: partial?.emptyWarning,
+    emptyWarningEn: partial?.emptyWarningEn,
+  };
+}
+
+/**
  * Real-time subscription to student homework on Cloud Firestore.
  * Scoped strictly to the active week (users/{cleanUid}/homework/week-${cycle}).
  * Enables instant cross-device synchronization between PC, tablet, and mobile!
@@ -4233,7 +4287,7 @@ export function subscribeToStudentHomeworkProgress(
   const unsubs: (() => void)[] = [];
   let activeHwUnsub: (() => void) | null = null;
 
-  const attachWeekListener = (cycle: number) => {
+  const attachWeekListener = (cycle: number, initialUserData?: any) => {
     if (activeHwUnsub) {
       activeHwUnsub();
       activeHwUnsub = null;
@@ -4246,9 +4300,63 @@ export function subscribeToStudentHomeworkProgress(
         hwDocRef,
         (snap) => {
           if (snap.exists()) {
-            const data = snap.data();
-            if (data && (data.completedPartsByDay || data.studentAnswers || data.matchingPairs)) {
-              callback(data as WeeklyHomeworkData);
+            // Canonical document EXISTS:
+            // Return its data even when empty or unanswered. Never consult legacy storage.
+            const data = (snap.data() || {}) as Partial<WeeklyHomeworkData>;
+            const hasCompletedParts = data.completedPartsByDay && Object.keys(data.completedPartsByDay).length > 0;
+            const hasAnswers = data.studentAnswers && (
+              (data.studentAnswers.matching && Object.keys(data.studentAnswers.matching).length > 0) ||
+              (data.studentAnswers.fillInBlanks && Object.keys(data.studentAnswers.fillInBlanks).length > 0) ||
+              (data.studentAnswers.sentences && Object.keys(data.studentAnswers.sentences).length > 0) ||
+              (data.studentAnswers.quizAnswers && Object.keys(data.studentAnswers.quizAnswers).length > 0)
+            );
+            const isCompleted = !!data.isCompleted || !!data.isDayPartCompleted;
+
+            if ((!hasCompletedParts && !hasAnswers && !isCompleted) || data.isEmpty) {
+              // Document is empty, reset, or unanswered: notify subscriber with clean initialized state
+              callback(createCleanInitializedHomework(cleanUid, studentEmail, cycle, data));
+            } else {
+              callback({
+                ...createCleanInitializedHomework(cleanUid, studentEmail, cycle, data),
+                ...data,
+                weekId: canonicalWeekId,
+                weeklyCycle: cycle,
+              } as WeeklyHomeworkData);
+            }
+          } else {
+            // Canonical document DOES NOT EXIST (deleted, missing, or not yet created)
+            if (cycle === 1) {
+              // Consult legacy Week 1 storage ONLY when canonical week-1 document does not exist
+              let usedLegacy = false;
+              if (
+                initialUserData?.weeklyHomework &&
+                (initialUserData.weeklyHomework.completedPartsByDay || initialUserData.weeklyHomework.studentAnswers)
+              ) {
+                callback(initialUserData.weeklyHomework as WeeklyHomeworkData);
+                usedLegacy = true;
+              }
+
+              if (!usedLegacy) {
+                // Check users/{cleanUid}/homework/current_week fallback
+                getDoc(doc(db, 'users', cleanUid, 'homework', 'current_week'))
+                  .then((legacySnap) => {
+                    if (legacySnap.exists()) {
+                      const lData = legacySnap.data() as WeeklyHomeworkData;
+                      if (lData && (lData.completedPartsByDay || lData.studentAnswers || lData.matchingPairs)) {
+                        callback(lData);
+                        return;
+                      }
+                    }
+                    callback(createCleanInitializedHomework(cleanUid, studentEmail, 1));
+                  })
+                  .catch(() => {
+                    callback(createCleanInitializedHomework(cleanUid, studentEmail, 1));
+                  });
+              }
+            } else {
+              // Week 2 or later: NEVER consult legacy Week 1 storage!
+              // Notify subscriber with clean initialized homework state
+              callback(createCleanInitializedHomework(cleanUid, studentEmail, cycle));
             }
           }
         },
@@ -4259,12 +4367,21 @@ export function subscribeToStudentHomeworkProgress(
     } catch {}
   };
 
-  const explicitCycle = parseWeekCycleNumber(weekId);
-  if (explicitCycle !== null) {
-    // Caller specified an explicit cycle
+  const isCurrentWeekAlias = weekId === 'current_week';
+  if (!isCurrentWeekAlias) {
+    const explicitCycle = parseWeekCycleNumber(weekId);
+    if (explicitCycle === null) {
+      // Requirement 1: Reject malformed explicit week identifiers.
+      // Do not silently interpret an invalid week as Week 1, and do not fall back to dynamic alias.
+      console.warn(
+        `[studentPersistence] subscribeToStudentHomeworkProgress: Rejecting malformed explicit week identifier '${weekId}' for ${cleanUid}. Refusing to default to Week 1.`
+      );
+      return () => {};
+    }
+    // Explicit valid week cycle confirmed
     attachWeekListener(explicitCycle);
   } else {
-    // Alias 'current_week': resolve dynamically from student profile
+    // Dynamic alias 'current_week': resolve dynamically from student profile
     try {
       const userRef = doc(db, 'users', cleanUid);
       let currentResolvedCycle: number | null = null;
@@ -4274,14 +4391,20 @@ export function subscribeToStudentHomeworkProgress(
           (snap) => {
             if (snap.exists()) {
               const uData = snap.data();
-              const newCycle = parseWeekCycleNumber(uData?.weeklyCycle) || 1;
+              const newCycle = parseWeekCycleNumber(uData?.weeklyCycle);
+              if (newCycle === null) {
+                // Requirement 1: Do not silently interpret an invalid or missing weeklyCycle as Week 1
+                if (activeHwUnsub) {
+                  activeHwUnsub();
+                  activeHwUnsub = null;
+                }
+                currentResolvedCycle = null;
+                return;
+              }
+              // Preserve valid Week 1 behavior when the cycle is explicitly confirmed
               if (newCycle !== currentResolvedCycle) {
                 currentResolvedCycle = newCycle;
-                attachWeekListener(newCycle);
-              }
-              // Week 1 legacy fallback only:
-              if (newCycle === 1 && !activeHwUnsub && uData?.weeklyHomework) {
-                callback(uData.weeklyHomework as WeeklyHomeworkData);
+                attachWeekListener(newCycle, uData);
               }
             }
           },

@@ -830,7 +830,12 @@ export default function App() {
 
     // If we already have an AI-generated homework and the collected words haven't changed, preserve it (unless it was generated with old template)!
     setWeeklyHomework((prev) => {
-      if (prev?.isAiGenerated && !prev.isEmpty && prev.totalWordsCollected > 0 && prev.targetDay === homeworkTargetDay) {
+      const isSameWeek =
+        prev &&
+        ((prev.weeklyCycle && generated.weeklyCycle && prev.weeklyCycle === generated.weeklyCycle) ||
+          (prev.weekId && generated.weekId && prev.weekId === generated.weekId));
+
+      if (isSameWeek && prev?.isAiGenerated && !prev.isEmpty && prev.totalWordsCollected > 0 && prev.targetDay === homeworkTargetDay) {
         const prevText = prev.readingPassage?.text || '';
         const prevTextLower = prevText.toLowerCase();
         const hasBadOldStoryOrBoilerplate =
@@ -862,17 +867,17 @@ export default function App() {
       }
       return {
         ...generated,
-        isCompleted: prev?.isCompleted || generated.isCompleted,
-        isDayPartCompleted: prev?.isDayPartCompleted || generated.isDayPartCompleted,
+        isCompleted: (isSameWeek && prev?.isCompleted) || generated.isCompleted,
+        isDayPartCompleted: (isSameWeek && prev?.isDayPartCompleted) || generated.isDayPartCompleted,
         completedPartsByDay: {
-          ...(prev?.completedPartsByDay || {}),
+          ...((isSameWeek && prev?.completedPartsByDay) || {}),
           ...(generated.completedPartsByDay || {}),
         },
         studentAnswers: {
-          matching: { ...(prev?.studentAnswers?.matching || {}), ...(generated.studentAnswers?.matching || {}) },
-          fillInBlanks: { ...(prev?.studentAnswers?.fillInBlanks || {}), ...(generated.studentAnswers?.fillInBlanks || {}) },
-          sentences: { ...(prev?.studentAnswers?.sentences || {}), ...(generated.studentAnswers?.sentences || {}) },
-          quizAnswers: { ...(prev?.studentAnswers?.quizAnswers || {}), ...(generated.studentAnswers?.quizAnswers || {}) },
+          matching: { ...((isSameWeek && prev?.studentAnswers?.matching) || {}), ...(generated.studentAnswers?.matching || {}) },
+          fillInBlanks: { ...((isSameWeek && prev?.studentAnswers?.fillInBlanks) || {}), ...(generated.studentAnswers?.fillInBlanks || {}) },
+          sentences: { ...((isSameWeek && prev?.studentAnswers?.sentences) || {}), ...(generated.studentAnswers?.sentences || {}) },
+          quizAnswers: { ...((isSameWeek && prev?.studentAnswers?.quizAnswers) || {}), ...(generated.studentAnswers?.quizAnswers || {}) },
         },
       };
     });
@@ -933,21 +938,28 @@ export default function App() {
         })),
       });
       if (generated) {
-        setWeeklyHomework((prev) => ({
-          ...generated,
-          isCompleted: prev?.isCompleted || generated.isCompleted,
-          isDayPartCompleted: prev?.isDayPartCompleted || generated.isDayPartCompleted,
-          completedPartsByDay: {
-            ...(prev?.completedPartsByDay || {}),
-            ...(generated.completedPartsByDay || {}),
-          },
-          studentAnswers: {
-            matching: { ...(prev?.studentAnswers?.matching || {}), ...(generated.studentAnswers?.matching || {}) },
-            fillInBlanks: { ...(prev?.studentAnswers?.fillInBlanks || {}), ...(generated.studentAnswers?.fillInBlanks || {}) },
-            sentences: { ...(prev?.studentAnswers?.sentences || {}), ...(generated.studentAnswers?.sentences || {}) },
-            quizAnswers: { ...(prev?.studentAnswers?.quizAnswers || {}), ...(generated.studentAnswers?.quizAnswers || {}) },
-          },
-        }));
+        setWeeklyHomework((prev) => {
+          const isSameWeek =
+            prev &&
+            ((prev.weeklyCycle && generated.weeklyCycle && prev.weeklyCycle === generated.weeklyCycle) ||
+              (prev.weekId && generated.weekId && prev.weekId === generated.weekId));
+
+          return {
+            ...generated,
+            isCompleted: (isSameWeek && prev?.isCompleted) || generated.isCompleted,
+            isDayPartCompleted: (isSameWeek && prev?.isDayPartCompleted) || generated.isDayPartCompleted,
+            completedPartsByDay: {
+              ...((isSameWeek && prev?.completedPartsByDay) || {}),
+              ...(generated.completedPartsByDay || {}),
+            },
+            studentAnswers: {
+              matching: { ...((isSameWeek && prev?.studentAnswers?.matching) || {}), ...(generated.studentAnswers?.matching || {}) },
+              fillInBlanks: { ...((isSameWeek && prev?.studentAnswers?.fillInBlanks) || {}), ...(generated.studentAnswers?.fillInBlanks || {}) },
+              sentences: { ...((isSameWeek && prev?.studentAnswers?.sentences) || {}), ...(generated.studentAnswers?.sentences || {}) },
+              quizAnswers: { ...((isSameWeek && prev?.studentAnswers?.quizAnswers) || {}), ...(generated.studentAnswers?.quizAnswers || {}) },
+            },
+          };
+        });
         if (generated.isAiGenerated) {
           setNotifications((prev) => [
             {
@@ -1020,6 +1032,7 @@ export default function App() {
     const queryParams = `email=${encodeURIComponent(email)}&role=${encodeURIComponent(role)}${uid ? `&uid=${encodeURIComponent(uid)}` : ''}`;
 
     const isTeacherRole = role === 'teacher' || role === 'admin';
+    let isCancelled = false;
 
     // 1. Fetch user-isolated lessons directly from Firestore + API atomically (Firestore is authoritative)
     Promise.all([
@@ -1275,23 +1288,35 @@ export default function App() {
             .catch(() => {});
 
           // 4. Fetch student homework and activity progress directly from Cloud Firestore (cross-device sync)
-          fetchStudentHomeworkProgressFromFirestore(uid, email)
+          const targetCycleForFetch = loadedCycle !== null ? loadedCycle : 1;
+          const targetWeekIdForFetch = normalizeWeekId(targetCycleForFetch) || 'week-1';
+
+          fetchStudentHomeworkProgressFromFirestore(uid, email, targetWeekIdForFetch)
             .then((cloudHw) => {
+              if (isCancelled) return;
               if (cloudHw && (cloudHw.completedPartsByDay || cloudHw.studentAnswers || cloudHw.matchingPairs)) {
+                const hwCycle = parseWeekCycleNumber(cloudHw.weeklyCycle) || parseWeekCycleNumber(cloudHw.weekId);
+                if (hwCycle !== null && hwCycle !== targetCycleForFetch) return;
+
                 setWeeklyHomework((prev) => {
-                  if (!prev) return cloudHw;
+                  const isSameWeek =
+                    prev &&
+                    ((prev.weeklyCycle && prev.weeklyCycle === targetCycleForFetch) ||
+                      (prev.weekId && prev.weekId === targetWeekIdForFetch));
+                  if (!isSameWeek) {
+                    return cloudHw;
+                  }
                   return {
                     ...prev,
                     ...cloudHw,
                     completedPartsByDay: {
-                      ...(prev.completedPartsByDay || {}),
                       ...(cloudHw.completedPartsByDay || {}),
                     },
                     studentAnswers: {
-                      matching: { ...(prev.studentAnswers?.matching || {}), ...(cloudHw.studentAnswers?.matching || {}) },
-                      fillInBlanks: { ...(prev.studentAnswers?.fillInBlanks || {}), ...(cloudHw.studentAnswers?.fillInBlanks || {}) },
-                      sentences: { ...(prev.studentAnswers?.sentences || {}), ...(cloudHw.studentAnswers?.sentences || {}) },
-                      quizAnswers: { ...(prev.studentAnswers?.quizAnswers || {}), ...(cloudHw.studentAnswers?.quizAnswers || {}) },
+                      matching: { ...(cloudHw.studentAnswers?.matching || {}) },
+                      fillInBlanks: { ...(cloudHw.studentAnswers?.fillInBlanks || {}) },
+                      sentences: { ...(cloudHw.studentAnswers?.sentences || {}) },
+                      quizAnswers: { ...(cloudHw.studentAnswers?.quizAnswers || {}) },
                     },
                     aiEvaluation: cloudHw.aiEvaluation || prev.aiEvaluation,
                     score: typeof cloudHw.score === 'number' ? cloudHw.score : prev.score,
@@ -1306,7 +1331,7 @@ export default function App() {
 
           if (loadedCycle !== null) {
             getAccessToken().then((token) => {
-              if (!token) return;
+              if (isCancelled || !token) return;
               const canonicalUid = auth.currentUser?.uid || (isValidCanonicalUid(uid) ? uid : '');
               if (!canonicalUid && !email) return;
 
@@ -1333,20 +1358,30 @@ export default function App() {
               })
                 .then((res) => (res.ok ? res.json() : null))
                 .then((savedHw) => {
+                  if (isCancelled) return;
                   if (savedHw && (savedHw.completedPartsByDay || savedHw.studentAnswers)) {
+                    const hwCycle = parseWeekCycleNumber(savedHw.weeklyCycle) || parseWeekCycleNumber(savedHw.weekId);
+                    if (hwCycle !== null && hwCycle !== loadedCycle) return;
+
                     setWeeklyHomework((prev) => {
-                      if (!prev) return savedHw;
+                      const isSameWeek =
+                        prev &&
+                        ((prev.weeklyCycle && prev.weeklyCycle === loadedCycle) ||
+                          (prev.weekId && prev.weekId === canonicalWeekId));
+                      if (!isSameWeek) {
+                        return savedHw;
+                      }
                       return {
                         ...prev,
+                        ...savedHw,
                         completedPartsByDay: {
-                          ...(prev.completedPartsByDay || {}),
                           ...(savedHw.completedPartsByDay || {}),
                         },
                         studentAnswers: {
-                          matching: { ...(prev.studentAnswers?.matching || {}), ...(savedHw.studentAnswers?.matching || {}) },
-                          fillInBlanks: { ...(prev.studentAnswers?.fillInBlanks || {}), ...(savedHw.studentAnswers?.fillInBlanks || {}) },
-                          sentences: { ...(prev.studentAnswers?.sentences || {}), ...(savedHw.studentAnswers?.sentences || {}) },
-                          quizAnswers: { ...(prev.studentAnswers?.quizAnswers || {}), ...(savedHw.studentAnswers?.quizAnswers || {}) },
+                          matching: { ...(savedHw.studentAnswers?.matching || {}) },
+                          fillInBlanks: { ...(savedHw.studentAnswers?.fillInBlanks || {}) },
+                          sentences: { ...(savedHw.studentAnswers?.sentences || {}) },
+                          quizAnswers: { ...(savedHw.studentAnswers?.quizAnswers || {}) },
                         },
                         aiEvaluation: savedHw.aiEvaluation || prev.aiEvaluation,
                         score: typeof savedHw.score === 'number' ? savedHw.score : prev.score,
@@ -1478,6 +1513,7 @@ export default function App() {
     }
 
     return () => {
+      isCancelled = true;
       unsubLessons();
     };
   }, [currentAccount?.email, currentAccount?.role, currentAccount?.uid, selectedStudentFilter, userProfile?.email]);
@@ -1658,37 +1694,112 @@ export default function App() {
 
   // Real-time synchronization of student homework and activity progress across all devices (Mobile <-> Desktop)
   useEffect(() => {
-    const uid = currentAccount?.uid || auth.currentUser?.uid || userProfile?.uid || userProfile?.id || '';
-    const email = currentAccount?.email || userProfile?.email || '';
+    const uid =
+      (currentAccount?.role === 'student'
+        ? (currentAccount?.uid || '')
+        : (selectedStudentFilter !== 'all' ? selectedStudentFilter : '')) ||
+      auth.currentUser?.uid ||
+      userProfile?.id ||
+      (userProfile as any)?.uid ||
+      '';
+    const email =
+      (currentAccount?.role === 'student'
+        ? (currentAccount?.email || '')
+        : (selectedStudentFilter !== 'all' ? selectedStudentFilter : '')) ||
+      auth.currentUser?.email ||
+      userProfile?.email ||
+      '';
     if (!uid && !email) return;
 
-    const unsub = subscribeToStudentHomeworkProgress(uid, email, (cloudHw) => {
-      if (cloudHw && (cloudHw.completedPartsByDay || cloudHw.studentAnswers || cloudHw.matchingPairs)) {
+    const activeCycle = parseWeekCycleNumber(userProfile?.weeklyCycle) || 1;
+    const activeWeekId = normalizeWeekId(activeCycle) || 'week-1';
+
+    let isCancelled = false;
+
+    const unsub = subscribeToStudentHomeworkProgress(
+      uid,
+      email,
+      (cloudHw) => {
+        if (isCancelled) return;
+
+        // Guard against stale callbacks from a different week cycle
+        const incomingCycle = parseWeekCycleNumber(cloudHw.weeklyCycle) || parseWeekCycleNumber(cloudHw.weekId);
+        if (incomingCycle !== null && incomingCycle !== activeCycle) {
+          return;
+        }
+
         setWeeklyHomework((prev) => {
-          if (!prev) return cloudHw;
+          const isSameWeek =
+            prev &&
+            ((prev.weeklyCycle && prev.weeklyCycle === activeCycle) ||
+              (prev.weekId && prev.weekId === activeWeekId));
+
+          // If previous state belonged to an older or different week, start completely fresh from cloudHw
+          if (!isSameWeek) {
+            return cloudHw;
+          }
+
+          // If the cloud homework is reset, empty, or unanswered:
+          const isResetOrEmpty =
+            (!cloudHw.studentAnswers ||
+              (Object.keys(cloudHw.studentAnswers.matching || {}).length === 0 &&
+                Object.keys(cloudHw.studentAnswers.fillInBlanks || {}).length === 0 &&
+                Object.keys(cloudHw.studentAnswers.sentences || {}).length === 0 &&
+                Object.keys(cloudHw.studentAnswers.quizAnswers || {}).length === 0)) &&
+            (!cloudHw.completedPartsByDay || Object.keys(cloudHw.completedPartsByDay).length === 0) &&
+            !cloudHw.isCompleted;
+
+          if (isResetOrEmpty) {
+            return {
+              ...prev,
+              ...cloudHw,
+              isCompleted: false,
+              isDayPartCompleted: false,
+              score: 0,
+              completedPartsByDay: {},
+              studentAnswers: {
+                matching: {},
+                fillInBlanks: {},
+                sentences: {},
+                quizAnswers: {},
+              },
+            };
+          }
+
           return {
             ...prev,
             ...cloudHw,
             completedPartsByDay: {
-              ...(prev.completedPartsByDay || {}),
               ...(cloudHw.completedPartsByDay || {}),
             },
             studentAnswers: {
-              matching: { ...(prev.studentAnswers?.matching || {}), ...(cloudHw.studentAnswers?.matching || {}) },
-              fillInBlanks: { ...(prev.studentAnswers?.fillInBlanks || {}), ...(cloudHw.studentAnswers?.fillInBlanks || {}) },
-              sentences: { ...(prev.studentAnswers?.sentences || {}), ...(cloudHw.studentAnswers?.sentences || {}) },
-              quizAnswers: { ...(prev.studentAnswers?.quizAnswers || {}), ...(cloudHw.studentAnswers?.quizAnswers || {}) },
+              matching: { ...(cloudHw.studentAnswers?.matching || {}) },
+              fillInBlanks: { ...(cloudHw.studentAnswers?.fillInBlanks || {}) },
+              sentences: { ...(cloudHw.studentAnswers?.sentences || {}) },
+              quizAnswers: { ...(cloudHw.studentAnswers?.quizAnswers || {}) },
             },
             aiEvaluation: cloudHw.aiEvaluation || prev.aiEvaluation,
             score: typeof cloudHw.score === 'number' ? cloudHw.score : prev.score,
             isCompleted: typeof cloudHw.isCompleted === 'boolean' ? cloudHw.isCompleted : prev.isCompleted,
           };
         });
-      }
-    });
+      },
+      activeWeekId
+    );
 
-    return () => unsub();
-  }, [currentAccount?.uid, currentAccount?.email, userProfile?.id]);
+    return () => {
+      isCancelled = true;
+      unsub();
+    };
+  }, [
+    currentAccount?.uid,
+    currentAccount?.email,
+    currentAccount?.role,
+    selectedStudentFilter,
+    userProfile?.id,
+    userProfile?.email,
+    userProfile?.weeklyCycle,
+  ]);
 
   // Real-time synchronization of student vocabulary dictionary across all devices & sessions (Mobile <-> Desktop)
   useEffect(() => {
