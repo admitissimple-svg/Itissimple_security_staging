@@ -50,6 +50,8 @@ import { Translations, getActivityDisplayName } from '../utils/i18n';
 import { defaultRoutinesByDay } from '../data/defaultRoutines';
 import { NativeFriendSpotifyTable } from './NativeFriendSpotifyTable';
 import { fetchWatchedVideosHistoryFromFirestore } from '../hooks/useRoutine';
+import { getAccessToken } from '../utils/auth';
+import { isValidCanonicalUid, normalizeWeekId, parseWeekCycleNumber } from '../utils/studentPersistence';
 
 interface TeacherMediaAssignmentPanelProps {
   routinesByDay: Record<DayOfWeek, RoutineItem[]>;
@@ -265,6 +267,8 @@ export const TeacherMediaAssignmentPanel: React.FC<TeacherMediaAssignmentPanelPr
       let profileData: any = null;
 
       if (activeStudentEmail || activeStudentUid) {
+        const token = await getAccessToken();
+
         const params = new URLSearchParams();
         if (activeStudentEmail) params.append('studentEmail', activeStudentEmail);
         if (activeStudentUid) params.append('uid', activeStudentUid);
@@ -273,16 +277,11 @@ export const TeacherMediaAssignmentPanel: React.FC<TeacherMediaAssignmentPanelPr
         if (activeStudentEmail) profileParams.append('email', activeStudentEmail);
         if (activeStudentUid) profileParams.append('uid', activeStudentUid);
 
-        const weeklyChecksPromise = activeStudentEmail
-          ? fetch(`/api/routines/weekly-checks?studentEmail=${encodeURIComponent(activeStudentEmail)}`).catch(() => null)
-          : Promise.resolve(null);
-
-        const [routinesRes, assignmentsRes, spotAssignRes, profileRes, weeklyChecksRes] = await Promise.all([
+        const [routinesRes, assignmentsRes, spotAssignRes, profileRes] = await Promise.all([
           fetch(`/api/student-routines?${params.toString()}`).catch(() => null),
           fetch(`/api/student-video-assignments?${params.toString()}`).catch(() => null),
           fetch(`/api/student-spotify-assignments?${params.toString()}`).catch(() => null),
           fetch(`/api/user-profile?${profileParams.toString()}`).catch(() => null),
-          weeklyChecksPromise,
         ]);
 
         if (routinesRes && routinesRes.ok) {
@@ -301,16 +300,45 @@ export const TeacherMediaAssignmentPanel: React.FC<TeacherMediaAssignmentPanelPr
           const profData = await profileRes.json();
           profileData = profData?.profile || profData?.user || null;
         }
-        if (weeklyChecksRes && weeklyChecksRes.ok) {
-          const checksData = await weeklyChecksRes.json();
-          if (checksData?.weeklyStudyDays && Array.isArray(checksData.weeklyStudyDays) && checksData.weeklyStudyDays.length > 0) {
-            profileData = {
-              ...(profileData || {}),
-              weeklyStudyDays: checksData.weeklyStudyDays,
-              weeklyStudyDaysTarget: checksData.weeklyStudyDaysTarget || checksData.weeklyStudyDays.length,
-            };
+
+        // Active week resolution strictly anchored to selected student's week, never the teacher's
+        let studentCycle = parseWeekCycleNumber(selectedStudent?.weeklyCycle);
+        if (studentCycle === null && profileData?.weeklyCycle) {
+          studentCycle = parseWeekCycleNumber(profileData.weeklyCycle);
+        }
+        const resolvedWeekId = studentCycle !== null ? normalizeWeekId(studentCycle) : 'current_week';
+
+        // Protected weekly-checks fetch with valid Bearer token and canonical student identity
+        if (token && (activeStudentEmail || (activeStudentUid && isValidCanonicalUid(activeStudentUid)))) {
+          try {
+            const checksParams = new URLSearchParams();
+            if (activeStudentEmail) checksParams.append('studentEmail', activeStudentEmail);
+            if (activeStudentUid && isValidCanonicalUid(activeStudentUid)) {
+              checksParams.append('studentUid', activeStudentUid);
+            }
+            if (resolvedWeekId) checksParams.append('weekId', resolvedWeekId);
+            if (studentCycle !== null) checksParams.append('weeklyCycle', String(studentCycle));
+
+            const weeklyChecksRes = await fetch(`/api/routines/weekly-checks?${checksParams.toString()}`, {
+              headers: {
+                Authorization: `Bearer ${token}`,
+              },
+            });
+            if (weeklyChecksRes && weeklyChecksRes.ok) {
+              const checksData = await weeklyChecksRes.json();
+              if (checksData?.weeklyStudyDays && Array.isArray(checksData.weeklyStudyDays) && checksData.weeklyStudyDays.length > 0) {
+                profileData = {
+                  ...(profileData || {}),
+                  weeklyStudyDays: checksData.weeklyStudyDays,
+                  weeklyStudyDaysTarget: checksData.weeklyStudyDaysTarget || checksData.weeklyStudyDays.length,
+                };
+              }
+            }
+          } catch (err) {
+            console.warn('Teacher weekly-checks fetch notice:', err);
           }
         }
+
         if (selectedStudent?.weeklyStudyDays && (!profileData?.weeklyStudyDays || profileData.weeklyStudyDays.length === 0)) {
           profileData = {
             ...(profileData || {}),

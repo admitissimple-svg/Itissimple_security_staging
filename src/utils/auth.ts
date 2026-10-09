@@ -81,6 +81,13 @@ export async function requestGoogleDriveAuth(hintEmail?: string): Promise<string
 }
 
 export async function getAccessToken(forceRefresh = false): Promise<string | null> {
+  if (!auth.currentUser && typeof (auth as any)?.authStateReady === 'function') {
+    try {
+      await (auth as any).authStateReady();
+    } catch {
+      // Ignore auth readiness errors
+    }
+  }
   if (auth.currentUser) {
     try {
       inMemoryToken = await auth.currentUser.getIdToken(forceRefresh);

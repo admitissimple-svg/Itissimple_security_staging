@@ -24,6 +24,7 @@ import {
 } from '../types';
 import { handleFirestoreError, OperationType, withFirestoreTimeout } from './routineSync';
 import { DAYS_OF_WEEK, getTodayDayOfWeek } from './notifications';
+import { getAccessToken } from './auth';
 import {
   assertSafeFirestoreWrite,
   validateFirestoreDocument,
@@ -2768,18 +2769,26 @@ export async function saveStudentWeeklyChecksToFirestore(
 
     // Mirror to backend server API for disk persistence & multi-device sync
     if (cleanEmail || cleanUid) {
-      fetch('/api/routines/weekly-checks', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          studentEmail: cleanEmail || cleanUid,
-          studentUid: cleanUid,
-          checks: sanitizedChecks,
-          weekId: targetWeekId,
-          weeklyCycle: targetCycle,
-          weeklyNativeLessonsTarget,
-          weeklyStudyDaysTarget,
-        }),
+      getAccessToken().then((token) => {
+        if (!token) return;
+        const currentAuthEmail = (auth?.currentUser?.email || '').toLowerCase().trim();
+        const safeStudentEmail = (cleanEmail && cleanEmail.includes('@') && (!currentAuthEmail || currentAuthEmail === cleanEmail)) ? cleanEmail : undefined;
+        fetch('/api/routines/weekly-checks', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({
+            studentUid: cleanUid,
+            ...(safeStudentEmail ? { studentEmail: safeStudentEmail } : {}),
+            checks: sanitizedChecks,
+            weekId: targetWeekId,
+            weeklyCycle: targetCycle,
+            weeklyNativeLessonsTarget,
+            weeklyStudyDaysTarget,
+          }),
+        }).catch(() => {});
       }).catch(() => {});
     }
 
@@ -3040,31 +3049,44 @@ export async function saveMemorizationCompletionToFirestore(
 
     // 3. Mirror to server API endpoints with week identifier
     if (cleanEmail || cleanUid) {
-      fetch('/api/routines/weekly-checks', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          studentEmail: cleanEmail || cleanUid,
-          studentUid: cleanUid,
-          checks: { [checkKey]: isCompleted },
-          weekId: targetWeekId,
-          weeklyCycle: targetCycle,
-        }),
-      }).catch(() => {});
+      getAccessToken().then((token) => {
+        if (!token) return;
+        const currentAuthEmail = (auth?.currentUser?.email || '').toLowerCase().trim();
+        const safeStudentEmail = (cleanEmail && cleanEmail.includes('@') && (!currentAuthEmail || currentAuthEmail === cleanEmail)) ? cleanEmail : undefined;
 
-      fetch('/api/homework', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          studentEmail: cleanEmail,
-          uid: cleanUid,
-          weekId: targetWeekId,
-          weeklyCycle: targetCycle,
-          weeklyHomework: {
-            completedPartsByDay: { [day]: isCompleted },
-            isDayPartCompleted: isCompleted,
+        fetch('/api/routines/weekly-checks', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
           },
-        }),
+          body: JSON.stringify({
+            studentUid: cleanUid,
+            ...(safeStudentEmail ? { studentEmail: safeStudentEmail } : {}),
+            checks: { [checkKey]: isCompleted },
+            weekId: targetWeekId,
+            weeklyCycle: targetCycle,
+          }),
+        }).catch(() => {});
+
+        fetch('/api/homework', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({
+            uid: cleanUid,
+            studentUid: cleanUid,
+            ...(safeStudentEmail ? { studentEmail: safeStudentEmail } : {}),
+            weekId: targetWeekId,
+            weeklyCycle: targetCycle,
+            weeklyHomework: {
+              completedPartsByDay: { [day]: isCompleted },
+              isDayPartCompleted: isCompleted,
+            },
+          }),
+        }).catch(() => {});
       }).catch(() => {});
     }
 
@@ -4014,16 +4036,26 @@ export async function saveStudentHomeworkProgressToFirestore(
 
     // 3. Mirror to server API for backup persistence with weekId & weeklyCycle
     if (cleanEmail || cleanUid) {
-      fetch('/api/homework', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          studentEmail: cleanEmail,
-          uid: cleanUid,
-          weekId: targetWeekId,
-          weeklyCycle: targetCycle,
-          weeklyHomework: payload,
-        }),
+      getAccessToken().then((token) => {
+        if (!token) return;
+        const currentAuthEmail = (auth?.currentUser?.email || '').toLowerCase().trim();
+        const safeStudentEmail = (cleanEmail && cleanEmail.includes('@') && (!currentAuthEmail || currentAuthEmail === cleanEmail)) ? cleanEmail : undefined;
+
+        fetch('/api/homework', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({
+            uid: cleanUid,
+            studentUid: cleanUid,
+            ...(safeStudentEmail ? { studentEmail: safeStudentEmail } : {}),
+            weekId: targetWeekId,
+            weeklyCycle: targetCycle,
+            weeklyHomework: payload,
+          }),
+        }).catch(() => {});
       }).catch(() => {});
     }
 
@@ -4129,9 +4161,31 @@ export async function fetchStudentHomeworkProgressFromFirestore(
     // 3. Server API fallback: strictly request targetWeekId & targetCycle
     if (cleanEmail || cleanUid) {
       try {
-        const res = await fetch(
-          `/api/homework?studentEmail=${encodeURIComponent(cleanEmail)}&uid=${encodeURIComponent(cleanUid)}&weekId=${encodeURIComponent(targetWeekId)}&weeklyCycle=${encodeURIComponent(String(targetCycle))}`
-        );
+        const token = await getAccessToken();
+        if (!token) {
+          // Authentication initializing or unavailable: do not execute unauthenticated fallback
+          return null;
+        }
+
+        const currentAuthEmail = (auth?.currentUser?.email || '').toLowerCase().trim();
+        const safeStudentEmail = (cleanEmail && cleanEmail.includes('@') && (!currentAuthEmail || currentAuthEmail === cleanEmail)) ? cleanEmail : '';
+
+        const params = new URLSearchParams();
+        if (cleanUid) {
+          params.append('uid', cleanUid);
+          params.append('studentUid', cleanUid);
+        }
+        if (safeStudentEmail) {
+          params.append('studentEmail', safeStudentEmail);
+        }
+        params.append('weekId', targetWeekId);
+        params.append('weeklyCycle', String(targetCycle));
+
+        const res = await fetch(`/api/homework?${params.toString()}`, {
+          headers: {
+            Authorization: `Bearer ${token}`,
+          },
+        });
         if (res.ok) {
           const apiData = await res.json();
           // Requirement 9: Prevent an unscoped legacy server response from being treated as valid Week 2+ completion data!

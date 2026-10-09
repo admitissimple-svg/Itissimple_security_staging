@@ -45,6 +45,7 @@ import { recordConsumedVideo, recordConsumedTrack } from './hooks/useStudentHist
 import { extractYouTubeVideoId, getYouTubeWatchUrl } from './utils/youtube';
 import { getInstantOrCachedWord } from './utils/dictionaryService';
 import { auth, getDb, getAllFirestoreDbs } from './firebase';
+import { getAccessToken } from './utils/auth';
 import { useNativeFriends, isTutorApproved, isTeacherRole } from './hooks/useNativeFriends';
 import { onAuthStateChanged, signOut as firebaseSignOutAuth } from 'firebase/auth';
 import { doc, getDoc, collection, getDocs, onSnapshot, setDoc, deleteDoc, query, where } from 'firebase/firestore';
@@ -1303,32 +1304,60 @@ export default function App() {
               console.warn('Notice loading homework from Firestore:', err);
             });
 
-          fetch(`/api/homework?studentEmail=${encodeURIComponent(email)}${uid ? `&uid=${encodeURIComponent(uid)}` : ''}`)
-            .then((res) => (res.ok ? res.json() : null))
-            .then((savedHw) => {
-              if (savedHw && (savedHw.completedPartsByDay || savedHw.studentAnswers)) {
-                setWeeklyHomework((prev) => {
-                  if (!prev) return savedHw;
-                  return {
-                    ...prev,
-                    completedPartsByDay: {
-                      ...(prev.completedPartsByDay || {}),
-                      ...(savedHw.completedPartsByDay || {}),
-                    },
-                    studentAnswers: {
-                      matching: { ...(prev.studentAnswers?.matching || {}), ...(savedHw.studentAnswers?.matching || {}) },
-                      fillInBlanks: { ...(prev.studentAnswers?.fillInBlanks || {}), ...(savedHw.studentAnswers?.fillInBlanks || {}) },
-                      sentences: { ...(prev.studentAnswers?.sentences || {}), ...(savedHw.studentAnswers?.sentences || {}) },
-                      quizAnswers: { ...(prev.studentAnswers?.quizAnswers || {}), ...(savedHw.studentAnswers?.quizAnswers || {}) },
-                    },
-                    aiEvaluation: savedHw.aiEvaluation || prev.aiEvaluation,
-                    score: typeof savedHw.score === 'number' ? savedHw.score : prev.score,
-                    isCompleted: typeof savedHw.isCompleted === 'boolean' ? savedHw.isCompleted : prev.isCompleted,
-                  };
-                });
+          if (loadedCycle !== null) {
+            getAccessToken().then((token) => {
+              if (!token) return;
+              const canonicalUid = auth.currentUser?.uid || (isValidCanonicalUid(uid) ? uid : '');
+              if (!canonicalUid && !email) return;
+
+              const currentAuthEmail = (auth?.currentUser?.email || '').toLowerCase().trim();
+              const safeEmail = (email && (!currentAuthEmail || currentAuthEmail === email.toLowerCase().trim())) ? email : '';
+              const canonicalWeekId = normalizeWeekId(loadedCycle);
+              if (!canonicalWeekId) return;
+
+              const hwParams = new URLSearchParams();
+              if (canonicalUid) {
+                hwParams.append('uid', canonicalUid);
+                hwParams.append('studentUid', canonicalUid);
               }
-            })
-            .catch(() => {});
+              if (safeEmail) {
+                hwParams.append('studentEmail', safeEmail);
+              }
+              hwParams.append('weekId', canonicalWeekId);
+              hwParams.append('weeklyCycle', String(loadedCycle));
+
+              fetch(`/api/homework?${hwParams.toString()}`, {
+                headers: {
+                  Authorization: `Bearer ${token}`,
+                },
+              })
+                .then((res) => (res.ok ? res.json() : null))
+                .then((savedHw) => {
+                  if (savedHw && (savedHw.completedPartsByDay || savedHw.studentAnswers)) {
+                    setWeeklyHomework((prev) => {
+                      if (!prev) return savedHw;
+                      return {
+                        ...prev,
+                        completedPartsByDay: {
+                          ...(prev.completedPartsByDay || {}),
+                          ...(savedHw.completedPartsByDay || {}),
+                        },
+                        studentAnswers: {
+                          matching: { ...(prev.studentAnswers?.matching || {}), ...(savedHw.studentAnswers?.matching || {}) },
+                          fillInBlanks: { ...(prev.studentAnswers?.fillInBlanks || {}), ...(savedHw.studentAnswers?.fillInBlanks || {}) },
+                          sentences: { ...(prev.studentAnswers?.sentences || {}), ...(savedHw.studentAnswers?.sentences || {}) },
+                          quizAnswers: { ...(prev.studentAnswers?.quizAnswers || {}), ...(savedHw.studentAnswers?.quizAnswers || {}) },
+                        },
+                        aiEvaluation: savedHw.aiEvaluation || prev.aiEvaluation,
+                        score: typeof savedHw.score === 'number' ? savedHw.score : prev.score,
+                        isCompleted: typeof savedHw.isCompleted === 'boolean' ? savedHw.isCompleted : prev.isCompleted,
+                      };
+                    });
+                  }
+                })
+                .catch(() => {});
+            }).catch(() => {});
+          }
         } catch (err) {
           console.warn('Could not fetch student data:', err);
         }
@@ -2825,12 +2854,6 @@ export default function App() {
           };
           if (uid || email) {
             saveStudentHomeworkProgressToFirestore(uid, email, updatedHw, activeWeekId);
-          } else {
-            fetch('/api/homework', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ weeklyHomework: updatedHw, weekId: activeWeekId }),
-            }).catch(() => {});
           }
           return updatedHw;
         });
@@ -3111,22 +3134,40 @@ export default function App() {
           {},
           studentEmail,
           userProfile?.weeklyNativeLessonsTarget || 1,
-          effectiveStudyTarget
+          effectiveStudyTarget,
+          effectiveCycle
         );
 
         // Persist weekly checks and study targets via weekly-checks endpoint as well
-        fetch('/api/routines/weekly-checks', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            studentEmail,
-            studentUid: uid,
-            checks: {},
-            weeklyNativeLessonsTarget: userProfile?.weeklyNativeLessonsTarget || 1,
-            weeklyStudyDaysTarget: effectiveStudyTarget,
-            weeklyStudyDays: effectiveStudyDays,
-          }),
-        }).catch(() => {});
+        const effectiveWeekId = normalizeWeekId(effectiveCycle);
+        if (effectiveCycle && effectiveWeekId) {
+          getAccessToken().then((token) => {
+            if (!token) return;
+            const canonicalUid = auth.currentUser?.uid || (isValidCanonicalUid(uid) ? uid : '');
+            if (!canonicalUid && !studentEmail) return;
+
+            const currentAuthEmail = (auth?.currentUser?.email || '').toLowerCase().trim();
+            const safeEmail = (studentEmail && (!currentAuthEmail || currentAuthEmail === studentEmail.toLowerCase().trim())) ? studentEmail : undefined;
+
+            fetch('/api/routines/weekly-checks', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                Authorization: `Bearer ${token}`,
+              },
+              body: JSON.stringify({
+                ...(canonicalUid ? { studentUid: canonicalUid } : {}),
+                ...(safeEmail ? { studentEmail: safeEmail } : {}),
+                checks: {},
+                weekId: effectiveWeekId,
+                weeklyCycle: effectiveCycle,
+                weeklyNativeLessonsTarget: userProfile?.weeklyNativeLessonsTarget || 1,
+                weeklyStudyDaysTarget: effectiveStudyTarget,
+                weeklyStudyDays: effectiveStudyDays,
+              }),
+            }).catch(() => {});
+          }).catch(() => {});
+        }
 
         // Automatic positioning on Today if in active study plan, otherwise first active study day
         const today = getTodayDayOfWeek();
@@ -5935,14 +5976,10 @@ export default function App() {
         setWeeklyHomework(updated);
         const uid = currentAccount?.uid || userProfile?.id || (userProfile as any)?.uid || '';
         const email = currentAccount?.email || userProfile?.email || '';
+        const currentActiveCycle = parseWeekCycleNumber(userProfile?.weeklyCycle);
+        const currentActiveWeekId = normalizeWeekId(currentActiveCycle);
         if (uid || email) {
-          saveStudentHomeworkProgressToFirestore(uid, email, updated);
-        } else {
-          fetch('/api/homework', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ weeklyHomework: updated }),
-          }).catch(() => {});
+          saveStudentHomeworkProgressToFirestore(uid, email, updated, currentActiveWeekId || undefined);
         }
       }}
       onRegenerateWithAi={handleRegenerateHomeworkWithAi}
@@ -5958,14 +5995,10 @@ export default function App() {
         setWeeklyHomework(updated);
         const uid = currentAccount?.uid || userProfile?.id || (userProfile as any)?.uid || '';
         const email = currentAccount?.email || userProfile?.email || '';
+        const currentActiveCycle = parseWeekCycleNumber(userProfile?.weeklyCycle);
+        const currentActiveWeekId = normalizeWeekId(currentActiveCycle);
         if (uid || email) {
-          saveStudentHomeworkProgressToFirestore(uid, email, updated);
-        } else {
-          fetch('/api/homework', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ weeklyHomework: updated }),
-          }).catch(() => {});
+          saveStudentHomeworkProgressToFirestore(uid, email, updated, currentActiveWeekId || undefined);
         }
         const wordsUsed = updated?.vocabularyList?.map((w) => w.word) || [];
         if (wordsUsed.length > 0) {

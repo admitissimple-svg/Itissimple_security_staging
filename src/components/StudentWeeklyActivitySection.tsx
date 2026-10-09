@@ -27,6 +27,8 @@ import {
 import { Translations, getTranslations } from '../utils/i18n';
 import { DAYS_OF_WEEK, getTodayDayOfWeek } from '../utils/notifications';
 import { getDailyMemorizationSchedule } from '../utils/homeworkGenerator';
+import { auth } from '../firebase';
+import { getAccessToken } from '../utils/auth';
 import {
   saveStudentWeeklyChecksToFirestore,
   fetchStudentWeeklyChecksFromFirestore,
@@ -40,6 +42,7 @@ import {
   getTodayIsoDate,
   mapStepIdToJournalType,
   deriveWeeklyChecksFromJournal,
+  isValidCanonicalUid,
   normalizeUid,
   normalizeWeekId,
   parseWeekCycleNumber,
@@ -344,23 +347,43 @@ export const StudentWeeklyActivitySection: React.FC<StudentWeeklyActivitySection
       );
     }
 
-    // Also fetch target from endpoint
-    if (studentEmail && activeWeekCycle !== null) {
-      fetch(`/api/routines/weekly-checks?studentEmail=${encodeURIComponent(studentEmail)}&weekId=${encodeURIComponent(activeWeekId || '')}`)
-        .then((res) => res.json())
-        .then((data) => {
-          if (isMounted && data) {
-            if (propWeeklyChecks === undefined && data.checks && Object.keys(data.checks).length > 0) {
-              setLocalWeeklyChecks((prev) => ({ ...prev, ...data.checks }));
-            }
-            if (typeof data.weeklyNativeLessonsTarget === 'number' && data.weeklyNativeLessonsTarget > 0) {
-              setWeeklyNativeTarget(data.weeklyNativeLessonsTarget);
-            }
-          }
+    // Also fetch target from endpoint with protected Firebase Auth & explicit week
+    if (activeWeekCycle !== null && activeWeekId) {
+      getAccessToken().then((token) => {
+        if (!isMounted || !token) return;
+
+        const canonicalUid = auth.currentUser?.uid || (isValidCanonicalUid(studentUid) ? studentUid : '');
+        if (!canonicalUid && !studentEmail) return;
+
+        const currentAuthEmail = (auth?.currentUser?.email || '').toLowerCase().trim();
+        const safeStudentEmail = (studentEmail && (!currentAuthEmail || currentAuthEmail === studentEmail.toLowerCase().trim())) ? studentEmail : '';
+
+        const params = new URLSearchParams();
+        if (canonicalUid) params.append('studentUid', canonicalUid);
+        if (safeStudentEmail) params.append('studentEmail', safeStudentEmail);
+        params.append('weekId', activeWeekId);
+        params.append('weeklyCycle', String(activeWeekCycle));
+
+        fetch(`/api/routines/weekly-checks?${params.toString()}`, {
+          headers: {
+            Authorization: `Bearer ${token}`,
+          },
         })
-        .catch((err) => {
-          console.warn('Error loading weekly checks from server:', err);
-        });
+          .then((res) => (res.ok ? res.json() : null))
+          .then((data) => {
+            if (isMounted && data) {
+              if (propWeeklyChecks === undefined && data.checks && Object.keys(data.checks).length > 0) {
+                setLocalWeeklyChecks((prev) => ({ ...prev, ...data.checks }));
+              }
+              if (typeof data.weeklyNativeLessonsTarget === 'number' && data.weeklyNativeLessonsTarget > 0) {
+                setWeeklyNativeTarget(data.weeklyNativeLessonsTarget);
+              }
+            }
+          })
+          .catch((err) => {
+            console.warn('Error loading weekly checks from server:', err);
+          });
+      }).catch(() => {});
     }
 
     return () => {
