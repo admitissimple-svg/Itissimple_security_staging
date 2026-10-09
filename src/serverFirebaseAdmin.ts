@@ -73,3 +73,10 @@ export function getFirebaseAdminAuth(): Auth {
   adminAuthInstance = getAuth(app);
   return adminAuthInstance;
 }
+
+/**
+ * Test helper allowing unit/integration tests to inject mock Auth instances.
+ */
+export function setFirebaseAdminAuthForTesting(mockAuth: Auth | null): void {
+  adminAuthInstance = mockAuth;
+}

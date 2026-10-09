@@ -66,7 +66,11 @@ import {
   profileWord,
 } from './src/utils/pedagogicalStorySynthesizer';
 import { analyzeSentenceGrammarDeterministic } from './src/utils/writingChecker';
-import { firebaseAuthMiddleware } from './src/middleware/firebaseAuth';
+import {
+  firebaseAuthMiddleware,
+  requireAdmin,
+  isVerifiedAdminRequest,
+} from './src/middleware/firebaseAuth';
 const rawEnvModel = (process.env.GEMINI_MODEL || '').trim();
 const isInvalidEnvModel = !rawEnvModel || rawEnvModel.includes('1.5') || rawEnvModel.includes('2.0') || rawEnvModel.startsWith('emini');
 const GEMINI_TEXT_MODEL = isInvalidEnvModel ? 'gemini-3.6-flash' : rawEnvModel;
@@ -2451,16 +2455,40 @@ app.post('/api/tutors', async (req, res) => {
   const cleanNameLower = cleanName.toLowerCase();
   const tutorId = newTutor.id || `tutor-${cleanEmail.replace(/[^a-zA-Z0-9]/g, '-')}`;
 
-  // Check if tutor already exists by explicit email or matching unique ID
+  // Audit protection: Check if caller is verified admin
+  const isAdminCaller = await isVerifiedAdminRequest(req);
+
+  // Prevent hijacking or overwriting administrator accounts
+  const isTargetAdmin =
+    cleanEmail === 'adm.itissimple@gmail.com' ||
+    (db.teachers || []).some((t: any) => t.email?.toLowerCase() === cleanEmail && t.role === 'admin');
+  if (isTargetAdmin && !isAdminCaller) {
+    return res.status(403).json({
+      error: 'Forbidden',
+      message: 'Access denied: Cannot register or overwrite an administrator account',
+    });
+  }
+
+  // Reject attempts to update or overwrite existing tutors by email, UID or ID
+  const incomingUid = (newTutor.uid || '').trim();
+  const incomingId = (newTutor.id || '').trim();
+
   const existingEmailIdx = (db.tutorsList || []).findIndex(
     (t: any) =>
       (t.email && t.email.toLowerCase() === cleanEmail) ||
-      (newTutor.id && t.id && t.id === newTutor.id)
+      (incomingId && t.id && t.id === incomingId) ||
+      (incomingUid && ((t.uid && t.uid === incomingUid) || (t.id && t.id === incomingUid)))
   );
 
-  if (existingEmailIdx >= 0 && !req.body.isUpdate && !newTutor.isUpdate) {
+  const existingTeacherIdx = (db.teachers || []).findIndex(
+    (t: any) =>
+      (t.email && t.email.toLowerCase() === cleanEmail) ||
+      (incomingUid && t.uid && t.uid === incomingUid)
+  );
+
+  if (existingEmailIdx >= 0 || existingTeacherIdx >= 0) {
     return res.status(409).json({
-      error: 'Este e-mail já está cadastrado no sistema como Amigo Nativo. Por favor, faça login com sua conta.',
+      error: 'Este e-mail ou identificador já está cadastrado no sistema como Amigo Nativo. Não é permitido atualizar ou sobrescrever registros existentes através deste cadastro público.',
       duplicateField: 'email',
       isExistingUser: true,
     });
@@ -2471,7 +2499,7 @@ app.post('/api/tutors', async (req, res) => {
     (t: any) => (t.name || '').trim().toLowerCase() === cleanNameLower && t.email?.toLowerCase() !== cleanEmail
   );
 
-  if (existingName && !req.body.isUpdate && !newTutor.isUpdate) {
+  if (existingName) {
     return res.status(409).json({
       error: 'Já existe um Amigo Nativo cadastrado com este nome na plataforma. Por favor, inclua seu sobrenome ou use um nome distintivo.',
       duplicateField: 'name',
@@ -2482,35 +2510,53 @@ app.post('/api/tutors', async (req, res) => {
   const rawVideoLink = (newTutor.videoIntroUrl || newTutor.youtubeUrl || newTutor.videoUrl || newTutor.introVideoUrl || '').trim();
   const extractedVideoId = newTutor.youtubeEmbedId || extractYouTubeVideoId(rawVideoLink) || '';
 
+  // Privilege audit: Non-admin callers CANNOT self-approve or assign approvalStatus
+  const resolvedApprovalStatus = isAdminCaller
+    ? (newTutor.approvalStatus || (newTutor.registeredByAdmin ? 'approved' : 'pending'))
+    : 'pending';
+  const resolvedIsApproved = isAdminCaller && (resolvedApprovalStatus === 'approved' || newTutor.isApproved === true);
+
   const tutorEntry = {
     ...newTutor,
     name: cleanName,
     id: tutorId,
     email: cleanEmail,
-    role: 'teacher',
+    role: 'teacher', // strictly enforce teacher role
     videoIntroUrl: rawVideoLink,
     youtubeUrl: rawVideoLink,
     videoUrl: rawVideoLink,
     introVideoUrl: rawVideoLink,
     youtubeEmbedId: extractedVideoId,
-    approvalStatus: newTutor.approvalStatus || (newTutor.registeredByAdmin ? 'approved' : 'pending'),
+    approvalStatus: resolvedApprovalStatus,
+    isApproved: resolvedIsApproved,
+    status: resolvedApprovalStatus,
+    approved: resolvedIsApproved,
+    registeredByAdmin: isAdminCaller && Boolean(newTutor.registeredByAdmin),
     appliedAt: newTutor.appliedAt || new Date().toISOString(),
   };
 
-  if (existingEmailIdx >= 0) {
-    db.tutorsList[existingEmailIdx] = { ...db.tutorsList[existingEmailIdx], ...tutorEntry };
-  } else {
-    db.tutorsList = db.tutorsList || [];
-    db.tutorsList.push(tutorEntry);
-  }
+  // Strip non-permitted privileged/administrative keys
+  delete (tutorEntry as any).isAdmin;
+  delete (tutorEntry as any).permissions;
+  delete (tutorEntry as any).credits;
+  delete (tutorEntry as any).isUpdate;
+  delete (tutorEntry as any).adminSettings;
+  delete (tutorEntry as any).assignedStudents;
+
+  db.tutorsList = db.tutorsList || [];
+  db.tutorsList.push(tutorEntry);
 
   // Also maintain teachers list for auth
-  const teacherIdx = db.teachers.findIndex((t) => t.email.toLowerCase() === cleanEmail);
-  if (teacherIdx >= 0) {
-    db.teachers[teacherIdx] = { ...db.teachers[teacherIdx], name: newTutor.name || cleanName, email: cleanEmail, role: 'teacher' };
-  } else {
-    db.teachers.push({ email: cleanEmail, name: newTutor.name || cleanName, role: 'teacher' });
-  }
+  db.teachers = db.teachers || [];
+  db.teachers.push({
+    email: cleanEmail,
+    name: newTutor.name || cleanName,
+    role: 'teacher',
+    approvalStatus: resolvedApprovalStatus,
+    isApproved: resolvedIsApproved,
+    status: resolvedApprovalStatus,
+    approved: resolvedIsApproved,
+  });
 
   // Ensure auth record exists with role 'teacher'
   if (!db.authUsers) db.authUsers = {};
@@ -2554,112 +2600,289 @@ app.post('/api/tutors', async (req, res) => {
     createdAt: tutorEntry.appliedAt,
   }).catch(() => {});
 
-  await saveAppStateToFirestore(db).catch((err) => {
-    console.warn('Background Firestore app_state sync notice:', err);
-  });
+  writeDb(db);
 
   res.json({ success: true, tutor: tutorEntry, tutors: db.tutorsList });
 });
 
-app.put('/api/tutors/:id', async (req, res) => {
+app.put('/api/tutors/:id', firebaseAuthMiddleware, async (req, res) => {
+  const caller = req.user;
+  if (!caller || !caller.uid) {
+    return res.status(401).json({
+      error: 'Unauthorized',
+      message: 'Authentication required: verified user token missing',
+    });
+  }
+
   const db = readDb();
-  const tutorId = req.params.id;
+  const tutorIdParam = decodeURIComponent(req.params.id || '').trim();
+  if (!tutorIdParam) {
+    return res.status(400).json({ error: 'Invalid tutor id' });
+  }
+
   const rawBody = req.body;
   const updatedData = rawBody?.tutor ? { ...rawBody.tutor } : { ...rawBody };
   if ((updatedData as any).tutor) delete (updatedData as any).tutor;
-  
-  const existingIdx = (db.tutorsList || []).findIndex(
-    (t) => t.id === tutorId || t.email?.toLowerCase() === tutorId?.toLowerCase()
+
+  let existingIdx = (db.tutorsList || []).findIndex(
+    (t: any) =>
+      (t.id && t.id.toLowerCase() === tutorIdParam.toLowerCase()) ||
+      (t.uid && t.uid === tutorIdParam) ||
+      (t.email && t.email.toLowerCase() === tutorIdParam.toLowerCase())
   );
 
-  if (existingIdx >= 0) {
-    const existingTutor = db.tutorsList[existingIdx];
-    const tEmail = (existingTutor.email || updatedData.email || '').toLowerCase();
-    const existingSettings = (db.teacherSettings && db.teacherSettings[tEmail]) || (db.meetSettings && db.meetSettings[tEmail]);
-
-    const rawVideoLink = (
-      updatedData.videoIntroUrl ||
-      updatedData.youtubeUrl ||
-      updatedData.videoUrl ||
-      updatedData.introVideoUrl ||
-      existingTutor.videoIntroUrl ||
-      existingTutor.youtubeUrl ||
-      existingTutor.videoUrl ||
-      existingTutor.introVideoUrl ||
-      ''
-    ).trim();
-    const extractedVideoId = updatedData.youtubeEmbedId || extractYouTubeVideoId(rawVideoLink) || existingTutor.youtubeEmbedId || '';
-
-    db.tutorsList[existingIdx] = {
-      ...existingTutor,
-      ...updatedData,
-      id: existingTutor.id || tutorId,
-      videoIntroUrl: rawVideoLink,
-      youtubeUrl: rawVideoLink,
-      videoUrl: rawVideoLink,
-      introVideoUrl: rawVideoLink,
-      youtubeEmbedId: extractedVideoId,
-      // Strictly preserve centralized meetUrl, availableDays, and availability
-      meetUrl: updatedData.meetUrl || existingTutor.meetUrl || existingSettings?.meetLink || '',
-      availableDays:
-        (updatedData.availableDays && updatedData.availableDays.length > 0)
-          ? updatedData.availableDays
-          : (existingTutor.availableDays || existingSettings?.availableDays || []),
-      availability:
-        updatedData.availability ||
-        existingTutor.availability ||
-        existingSettings?.availability ||
-        existingSettings?.availableHoursByDay,
-    };
-    
-    // Sync with db.teachers
-    const currentTutor = db.tutorsList[existingIdx];
-    const teacherIdx = (db.teachers || []).findIndex((tc: any) => tc.email?.toLowerCase() === tEmail);
-    if (teacherIdx >= 0) {
-      db.teachers[teacherIdx] = {
-        ...db.teachers[teacherIdx],
-        name: currentTutor.name,
-        avatar: currentTutor.avatar,
-        country: currentTutor.country,
-        accent: currentTutor.accent,
-        timezone: currentTutor.timezone,
-        availableDays: currentTutor.availableDays,
-        videoIntroUrl: currentTutor.videoIntroUrl,
+  if (existingIdx === -1) {
+    const teacherEntry = (db.teachers || []).find(
+      (t: any) =>
+        (t.uid && t.uid === tutorIdParam) ||
+        (t.email && t.email.toLowerCase() === tutorIdParam.toLowerCase())
+    );
+    if (teacherEntry) {
+      const cleanEmail = (teacherEntry.email || '').toLowerCase().trim();
+      const syntheticTutor = {
+        id: tutorIdParam.includes('@') ? `tutor-${cleanEmail.replace(/[^a-zA-Z0-9]/g, '-')}` : tutorIdParam,
+        uid: teacherEntry.uid,
+        name: teacherEntry.name,
+        email: cleanEmail,
+        role: 'teacher',
+        approvalStatus: teacherEntry.approvalStatus || 'pending',
+        isApproved: teacherEntry.isApproved || false,
+        status: teacherEntry.status || teacherEntry.approvalStatus || 'pending',
+        approved: teacherEntry.approved || teacherEntry.isApproved || false,
+        avatar: teacherEntry.avatar || '',
+        country: teacherEntry.country || '',
+        accent: teacherEntry.accent || '',
+        timezone: teacherEntry.timezone || '',
       };
+      db.tutorsList = db.tutorsList || [];
+      db.tutorsList.push(syntheticTutor);
+      existingIdx = db.tutorsList.length - 1;
     }
-
-    // Sync with db.teacherSettings
-    if (tEmail) {
-      db.teacherSettings = db.teacherSettings || {};
-      db.teacherSettings[tEmail] = {
-        ...db.teacherSettings[tEmail],
-        teacherEmail: tEmail,
-        ...(currentTutor.meetUrl ? { meetLink: currentTutor.meetUrl } : {}),
-        ...(currentTutor.timezone ? { timezone: currentTutor.timezone } : {}),
-        ...(currentTutor.availableDays && currentTutor.availableDays.length > 0 ? { availableDays: currentTutor.availableDays } : {}),
-      };
-    }
-
-    // Direct Firestore persistence
-    await saveTutorToFirestore(db.tutorsList[existingIdx]).catch((err) => {
-      console.warn('Error saving updated tutor to Firestore collection:', err);
-    });
-
-    writeDb(db);
-    return res.json({ success: true, tutor: db.tutorsList[existingIdx], tutors: db.tutorsList });
   }
 
-  // If not found in db.tutorsList, insert it
-  const newEntry = { ...updatedData, id: tutorId };
-  db.tutorsList = db.tutorsList || [];
-  db.tutorsList.push(newEntry);
-  await saveTutorToFirestore(newEntry).catch(() => {});
+  if (existingIdx === -1) {
+    return res.status(404).json({
+      error: 'Not Found',
+      message: 'Tutor não encontrado',
+    });
+  }
+
+  const existingTutor = db.tutorsList[existingIdx];
+  const existingEmail = (existingTutor.email || '').toLowerCase().trim();
+  const existingUid = (existingTutor.uid || '').trim();
+  const existingId = (existingTutor.id || '').trim();
+
+  const callerEmail = (caller.email || '').toLowerCase().trim();
+  const callerUid = (caller.uid || '').trim();
+
+  // Audit protection: Check if caller is verified admin
+  const isAdmin = caller.role === 'admin';
+
+  // Ownership verification based strictly on server-verified token and trusted record identifiers
+  const isOwner = Boolean(
+    (existingUid && existingUid === callerUid) ||
+    (existingId && existingId === callerUid) ||
+    (callerEmail && existingEmail && callerEmail === existingEmail)
+  );
+
+  // Requirement 2: Autorizar somente o próprio professor ou um administrador com custom claim role === 'admin'
+  const isAuthorized = isAdmin || (caller.role === 'teacher' && isOwner);
+  if (!isAuthorized) {
+    return res.status(403).json({
+      error: 'Forbidden',
+      message: 'Access denied: You are not authorized to update this tutor profile',
+    });
+  }
+
+  // Prevent modifying an administrator account through tutor profile endpoint
+  const isTargetAdmin =
+    existingEmail === 'adm.itissimple@gmail.com' ||
+    (db.teachers || []).some((t: any) => t.email?.toLowerCase() === existingEmail && t.role === 'admin');
+
+  if (isTargetAdmin && !isAdmin) {
+    return res.status(403).json({
+      error: 'Forbidden',
+      message: 'Access denied: Cannot modify administrator account through tutor endpoint',
+    });
+  }
+
+  // Requirement 4: Allowlist explícita de campos de perfil editáveis por professores
+  const TEACHER_EDITABLE_FIELDS = new Set([
+    'name',
+    'avatar',
+    'photoUrl',
+    'country',
+    'countryCode',
+    'flag',
+    'accent',
+    'headline',
+    'bio',
+    'specialties',
+    'videoIntroUrl',
+    'youtubeUrl',
+    'videoUrl',
+    'introVideoUrl',
+    'youtubeEmbedId',
+    'pricePerSessionUsd',
+    'pricePerSessionBrl',
+    'languagesSpoken',
+    'timezone',
+    'meetUrl',
+    'meetLink',
+    'availableDays',
+    'availableHours',
+    'availability',
+    'availableHoursByDay',
+  ]);
+
+  const fieldsToApply: Record<string, any> = {};
+
+  if (isAdmin) {
+    // Admin can update teacher editable fields + approval/status fields
+    const ADMIN_ADDITIONAL_FIELDS = new Set([
+      'approvalStatus',
+      'isApproved',
+      'status',
+      'approved',
+      'registeredByAdmin',
+      'isSuperTutor',
+      'rating',
+      'reviewsCount',
+      'activeStudents',
+      'lessonsTaught',
+    ]);
+
+    for (const [key, val] of Object.entries(updatedData)) {
+      if (TEACHER_EDITABLE_FIELDS.has(key) || ADMIN_ADDITIONAL_FIELDS.has(key)) {
+        fieldsToApply[key] = val;
+      }
+    }
+
+    if (fieldsToApply.approvalStatus !== undefined) {
+      const isApp = fieldsToApply.approvalStatus === 'approved';
+      fieldsToApply.isApproved = fieldsToApply.isApproved ?? isApp;
+      fieldsToApply.status = fieldsToApply.status ?? fieldsToApply.approvalStatus;
+      fieldsToApply.approved = fieldsToApply.approved ?? isApp;
+    }
+  } else {
+    // Regular teacher: strictly apply ONLY fields from TEACHER_EDITABLE_FIELDS
+    for (const [key, val] of Object.entries(updatedData)) {
+      if (TEACHER_EDITABLE_FIELDS.has(key)) {
+        fieldsToApply[key] = val;
+      }
+    }
+  }
+
+  // Requirement 6: Não permitir alterações de configurações administrativas, créditos, vínculos com alunos ou permissões
+  // (Ensured by allowlist: any admin settings, credits, student assignments, permissions are ignored)
+
+  const tEmail = existingEmail;
+  const existingSettings = (db.teacherSettings && db.teacherSettings[tEmail]) || (db.meetSettings && db.meetSettings[tEmail]);
+
+  const rawVideoLink = (
+    fieldsToApply.videoIntroUrl ||
+    fieldsToApply.youtubeUrl ||
+    fieldsToApply.videoUrl ||
+    fieldsToApply.introVideoUrl ||
+    existingTutor.videoIntroUrl ||
+    existingTutor.youtubeUrl ||
+    existingTutor.videoUrl ||
+    existingTutor.introVideoUrl ||
+    ''
+  ).trim();
+  const extractedVideoId = fieldsToApply.youtubeEmbedId || extractYouTubeVideoId(rawVideoLink) || existingTutor.youtubeEmbedId || '';
+
+  const resolvedApprovalStatus = isAdmin
+    ? (fieldsToApply.approvalStatus ?? existingTutor.approvalStatus ?? 'pending')
+    : (existingTutor.approvalStatus ?? 'pending');
+  const resolvedIsApproved = isAdmin
+    ? (fieldsToApply.isApproved ?? existingTutor.isApproved ?? (resolvedApprovalStatus === 'approved'))
+    : (existingTutor.isApproved ?? (existingTutor.approvalStatus === 'approved'));
+  const resolvedStatus = isAdmin
+    ? (fieldsToApply.status ?? existingTutor.status ?? resolvedApprovalStatus)
+    : (existingTutor.status ?? existingTutor.approvalStatus ?? 'pending');
+  const resolvedApproved = isAdmin
+    ? (fieldsToApply.approved ?? existingTutor.approved ?? resolvedIsApproved)
+    : (existingTutor.approved ?? existingTutor.isApproved ?? false);
+
+  const updatedTutor = {
+    ...existingTutor,
+    ...fieldsToApply,
+    // Immutable/protected identifiers (Requirement 5):
+    id: existingTutor.id,
+    email: existingTutor.email,
+    uid: existingTutor.uid || caller.uid,
+    role: 'teacher',
+    approvalStatus: resolvedApprovalStatus,
+    isApproved: resolvedIsApproved,
+    status: resolvedStatus,
+    approved: resolvedApproved,
+    registeredByAdmin: isAdmin
+      ? (fieldsToApply.registeredByAdmin ?? existingTutor.registeredByAdmin ?? false)
+      : (existingTutor.registeredByAdmin ?? false),
+    videoIntroUrl: rawVideoLink,
+    youtubeUrl: rawVideoLink,
+    videoUrl: rawVideoLink,
+    introVideoUrl: rawVideoLink,
+    youtubeEmbedId: extractedVideoId,
+    // Strictly preserve centralized meetUrl, availableDays, and availability if not in fieldsToApply
+    meetUrl: fieldsToApply.meetUrl || existingTutor.meetUrl || existingSettings?.meetLink || '',
+    availableDays:
+      (fieldsToApply.availableDays && fieldsToApply.availableDays.length > 0)
+        ? fieldsToApply.availableDays
+        : (existingTutor.availableDays || existingSettings?.availableDays || []),
+    availability:
+      fieldsToApply.availability ||
+      existingTutor.availability ||
+      existingSettings?.availability ||
+      existingSettings?.availableHoursByDay,
+    updatedAt: new Date().toISOString(),
+  };
+
+  db.tutorsList[existingIdx] = updatedTutor;
+
+  // Sync with db.teachers
+  const teacherIdx = (db.teachers || []).findIndex((tc: any) => tc.email?.toLowerCase() === tEmail);
+  if (teacherIdx >= 0) {
+    db.teachers[teacherIdx] = {
+      ...db.teachers[teacherIdx],
+      name: updatedTutor.name,
+      avatar: updatedTutor.avatar,
+      country: updatedTutor.country,
+      accent: updatedTutor.accent,
+      timezone: updatedTutor.timezone,
+      availableDays: updatedTutor.availableDays,
+      videoIntroUrl: updatedTutor.videoIntroUrl,
+      approvalStatus: resolvedApprovalStatus,
+      isApproved: resolvedIsApproved,
+      status: resolvedStatus,
+      approved: resolvedApproved,
+    };
+  }
+
+  // Sync with db.teacherSettings
+  if (tEmail) {
+    db.teacherSettings = db.teacherSettings || {};
+    db.teacherSettings[tEmail] = {
+      ...db.teacherSettings[tEmail],
+      teacherEmail: tEmail,
+      ...(updatedTutor.meetUrl ? { meetLink: updatedTutor.meetUrl } : {}),
+      ...(updatedTutor.timezone ? { timezone: updatedTutor.timezone } : {}),
+      ...(updatedTutor.availableDays && updatedTutor.availableDays.length > 0 ? { availableDays: updatedTutor.availableDays } : {}),
+    };
+  }
+
+  // Direct Firestore persistence
+  await saveTutorToFirestore(updatedTutor).catch((err) => {
+    console.warn('Error saving updated tutor to Firestore collection:', err);
+  });
+
   writeDb(db);
-  res.json({ success: true, tutor: newEntry, tutors: db.tutorsList });
+  return res.json({ success: true, tutor: updatedTutor, tutors: db.tutorsList });
 });
 
-// Admin Delete Tutor
-app.delete('/api/tutors/:id', async (req, res) => {
+  // Admin Delete Tutor
+app.delete('/api/tutors/:id', firebaseAuthMiddleware, requireAdmin, async (req, res) => {
   const db = readDb();
   const tutorId = decodeURIComponent(req.params.id);
   const targetEmailQuery = ((req.query.email as string) || '').toLowerCase();
@@ -2675,6 +2898,18 @@ app.delete('/api/tutors/:id', async (req, res) => {
     targetEmailQuery ||
     (tutorId.includes('@') ? tutorId : '')
   )?.toLowerCase();
+
+  // Safeguard: Primary administrator account can NEVER be deleted via tutors endpoint
+  if (
+    targetEmail === 'adm.itissimple@gmail.com' ||
+    tutorId.toLowerCase() === 'adm.itissimple@gmail.com' ||
+    (targetTutor && (targetTutor.role === 'admin' || targetTutor.email?.toLowerCase() === 'adm.itissimple@gmail.com'))
+  ) {
+    return res.status(403).json({
+      error: 'Forbidden',
+      message: 'Cannot delete primary system administrator account',
+    });
+  }
 
   // Track permanently so deleted tutors are NEVER re-added by defaults or sync
   db.deletedTutorIds = Array.from(
@@ -2722,7 +2957,7 @@ app.delete('/api/tutors/:id', async (req, res) => {
   res.json({ success: true, message: 'Amigo Nativo excluído com sucesso.', tutors: db.tutorsList });
 });
 
-app.post('/api/tutors/:id/approve', async (req, res) => {
+app.post('/api/tutors/:id/approve', firebaseAuthMiddleware, requireAdmin, async (req, res) => {
   const db = readDb();
   const tutorId = req.params.id;
   let approvedEmail = '';
@@ -2786,7 +3021,7 @@ app.post('/api/tutors/:id/approve', async (req, res) => {
   res.json({ success: true, tutors: db.tutorsList, approvedTutor });
 });
 
-app.post('/api/tutors/:id/reject', async (req, res) => {
+app.post('/api/tutors/:id/reject', firebaseAuthMiddleware, requireAdmin, async (req, res) => {
   const db = readDb();
   const tutorId = req.params.id;
   let rejectedEmail = '';
@@ -2830,26 +3065,55 @@ app.post('/api/tutors/:id/reject', async (req, res) => {
   res.json({ success: true, tutors: db.tutorsList });
 });
 
-app.post('/api/teachers', (req, res) => {
+app.post('/api/teachers', firebaseAuthMiddleware, requireAdmin, (req, res) => {
   const db = readDb();
   const newTeacher = req.body.teacher || req.body;
   if (!newTeacher || !newTeacher.email) {
     return res.status(400).json({ error: 'Invalid teacher data' });
   }
   const cleanEmail = newTeacher.email.toLowerCase().trim();
+
+  // Prevent modifying or downgrading administrator accounts
+  const isTargetAdmin =
+    cleanEmail === 'adm.itissimple@gmail.com' ||
+    (db.teachers || []).some((t: any) => t.email?.toLowerCase() === cleanEmail && t.role === 'admin');
+
+  if (isTargetAdmin) {
+    return res.status(403).json({
+      error: 'Forbidden',
+      message: 'System administrator account cannot be modified via teachers endpoint',
+    });
+  }
+
+  const teacherEntry = {
+    ...newTeacher,
+    email: cleanEmail,
+    role: 'teacher', // strictly enforce teacher role
+  };
+
   const existingIdx = db.teachers.findIndex((t) => t.email.toLowerCase() === cleanEmail);
   if (existingIdx >= 0) {
-    db.teachers[existingIdx] = { ...db.teachers[existingIdx], ...newTeacher, email: cleanEmail };
+    db.teachers[existingIdx] = { ...db.teachers[existingIdx], ...teacherEntry };
   } else {
-    db.teachers.push({ ...newTeacher, email: cleanEmail });
+    db.teachers.push(teacherEntry);
   }
   writeDb(db);
   res.json({ success: true, teachers: db.teachers });
 });
 
-app.delete('/api/teachers/:email', (req, res) => {
+app.delete('/api/teachers/:email', firebaseAuthMiddleware, requireAdmin, (req, res) => {
   const db = readDb();
   const email = decodeURIComponent(req.params.email).toLowerCase().trim();
+  const isTargetAdmin =
+    email === 'adm.itissimple@gmail.com' ||
+    (db.teachers || []).some((t: any) => t.email?.toLowerCase() === email && t.role === 'admin');
+
+  if (isTargetAdmin) {
+    return res.status(403).json({
+      error: 'Forbidden',
+      message: 'Cannot delete primary system administrator account',
+    });
+  }
   db.teachers = db.teachers.filter((t) => t.email.toLowerCase() !== email);
   writeDb(db);
   res.json({ success: true, teachers: db.teachers });

@@ -240,3 +240,34 @@ export const requireStudent = (
   next();
 };
 
+/**
+ * Safely checks if a request has a valid Firebase ID token with custom claim role === 'admin'.
+ * Returns true only if verified by Firebase Admin SDK.
+ * Returns false on any failure, unauthenticated request, or non-admin role.
+ */
+export async function isVerifiedAdminRequest(req: Request): Promise<boolean> {
+  // If request was already processed by firebaseAuthMiddleware
+  if (req.user && req.user.uid) {
+    return req.user.role === 'admin';
+  }
+
+  const authHeader = req.headers.authorization;
+  if (!authHeader) {
+    return false;
+  }
+
+  const parts = authHeader.trim().split(/\s+/);
+  if (parts.length !== 2 || parts[0]?.toLowerCase() !== 'bearer' || !parts[1]) {
+    return false;
+  }
+
+  const idToken = parts[1];
+  try {
+    const adminAuth = getFirebaseAdminAuth();
+    const decodedToken = await adminAuth.verifyIdToken(idToken);
+    return extractTrustedRole(decodedToken) === 'admin';
+  } catch {
+    return false;
+  }
+}
+
