@@ -1,92 +1,70 @@
-import { initializeApp, getApps, getApp } from 'firebase/app';
-import { getFirestore, setLogLevel, doc, getDoc, setDoc, collection, getDocs, deleteDoc, query, where } from 'firebase/firestore';
-import fs from 'fs';
-import path from 'path';
+import { getFirestore, Firestore } from 'firebase-admin/firestore';
+import { getFirebaseAdminApp, ALLOWED_STAGING_PROJECT_ID } from './serverFirebaseAdmin';
 
-try {
-  setLogLevel('silent');
-} catch {}
+/**
+ * Active identifiers for staging persistence.
+ * Strictly bound to ALLOWED_STAGING_PROJECT_ID ('itissimple-security-staging').
+ * All references to legacy projects, Web SDK configs, and external API keys are eliminated.
+ */
+export const ACTIVE_FIREBASE_PROJECT_ID = ALLOWED_STAGING_PROJECT_ID;
+export const ACTIVE_FIREBASE_DATABASE_ID = '(default)';
+export const ACTIVE_FIRESTORE_DATABASE_ID = '(default)';
 
-// Active and exclusive project identifiers
-export const ACTIVE_FIREBASE_PROJECT_ID = 'itissimple-8663d';
-export const ACTIVE_PROJECT_NUMBER = '245342369537';
-export const ACTIVE_FIREBASE_AUTH_DOMAIN = `${ACTIVE_FIREBASE_PROJECT_ID}.firebaseapp.com`;
-export const ACTIVE_FIREBASE_STORAGE_BUCKET = `${ACTIVE_FIREBASE_PROJECT_ID}.firebasestorage.app`;
-export const ACTIVE_OAUTH_CLIENT_ID = '245342369537-9e4gb01shgsacvt7dkd66d64orr20fn6.apps.googleusercontent.com';
-export const ACTIVE_FIREBASE_APP_ID = '1:245342369537:web:9ef6a4347068d358d68d00';
-export const ACTIVE_APP_ID = ACTIVE_FIREBASE_APP_ID;
-export const ACTIVE_FIREBASE_DATABASE_ID = 
-  (typeof process !== 'undefined' && process.env && process.env.FIREBASE_DATABASE_ID && process.env.FIREBASE_DATABASE_ID !== '(default)')
-    ? process.env.FIREBASE_DATABASE_ID
-    : '(default)';
-export const ACTIVE_FIRESTORE_DATABASE_ID = ACTIVE_FIREBASE_DATABASE_ID;
+let adminFirestoreInstance: Firestore | null = null;
 
-let dbInstance: any = null;
-let defaultDbInstance: any = null;
-
-export function getDefaultFirestoreDb() {
-  if (defaultDbInstance) return defaultDbInstance;
-  try {
-    const configPath = path.join(process.cwd(), 'firebase-applet-config.json');
-    if (fs.existsSync(configPath)) {
-      const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
-      config.projectId = ACTIVE_FIREBASE_PROJECT_ID;
-      config.appId = config.appId || ACTIVE_FIREBASE_APP_ID;
-      config.apiKey = process.env.FIREBASE_API_KEY || config.apiKey || 'AIzaSyBDgPCPMD5wd36mSX0lkkyECz6-rHJdBqk';
-      config.authDomain = ACTIVE_FIREBASE_AUTH_DOMAIN;
-      config.storageBucket = config.storageBucket || ACTIVE_FIREBASE_STORAGE_BUCKET;
-      const app = getApps().length === 0 ? initializeApp(config) : getApp();
-      defaultDbInstance = getFirestore(app);
-      return defaultDbInstance;
+/**
+ * Returns a validated Firestore instance from Firebase Admin SDK.
+ * Strictly checks that the underlying app is initialized with ALLOWED_STAGING_PROJECT_ID.
+ * Uses exclusively the '(default)' database.
+ */
+export function getFirestoreDb(): Firestore | null {
+  if (adminFirestoreInstance) {
+    const cachedProjectId = (adminFirestoreInstance as any).projectId;
+    if (cachedProjectId && cachedProjectId !== ALLOWED_STAGING_PROJECT_ID) {
+      throw new Error(
+        `[serverFirestore Security] Unauthorized Firestore instance detected for project '${cachedProjectId}'. Strictly expected '${ALLOWED_STAGING_PROJECT_ID}'.`
+      );
     }
-  } catch (err) {
-    console.warn('Could not initialize default Firebase Firestore SDK:', err);
+    return adminFirestoreInstance;
   }
-  return null;
-}
-
-export function getFirestoreDb() {
-  if (dbInstance) return dbInstance;
 
   try {
-    const configPath = path.join(process.cwd(), 'firebase-applet-config.json');
-    if (fs.existsSync(configPath)) {
-      const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
-      // Enforce active project configuration: itissimple-8663d and dedicated firestore database ID
-      config.projectId = ACTIVE_FIREBASE_PROJECT_ID;
-      config.appId = config.appId || ACTIVE_FIREBASE_APP_ID;
-      config.apiKey = process.env.FIREBASE_API_KEY || config.apiKey || 'AIzaSyBDgPCPMD5wd36mSX0lkkyECz6-rHJdBqk';
-      config.authDomain = ACTIVE_FIREBASE_AUTH_DOMAIN;
-      config.storageBucket = config.storageBucket || ACTIVE_FIREBASE_STORAGE_BUCKET;
-      const targetDbId = (config.firestoreDatabaseId && config.firestoreDatabaseId !== '(default)')
-        ? config.firestoreDatabaseId
-        : ACTIVE_FIRESTORE_DATABASE_ID;
-      config.firestoreDatabaseId = targetDbId;
-      config.messagingSenderId = ACTIVE_PROJECT_NUMBER;
-      config.oAuthClientId = config.oAuthClientId || ACTIVE_OAUTH_CLIENT_ID;
-
-      const app = getApps().length === 0 ? initializeApp(config) : getApp();
-      dbInstance = targetDbId && targetDbId !== '(default)'
-        ? getFirestore(app, targetDbId)
-        : getFirestore(app);
-      return dbInstance;
+    const app = getFirebaseAdminApp();
+    const appProjectId = app.options?.projectId;
+    if (appProjectId !== ALLOWED_STAGING_PROJECT_ID) {
+      throw new Error(
+        `[serverFirestore Security] Firebase Admin App is bound to unauthorized project '${appProjectId}'. Refusing to create Firestore client.`
+      );
     }
+    adminFirestoreInstance = getFirestore(app, '(default)');
+    return adminFirestoreInstance;
   } catch (err) {
-    console.warn('Could not initialize Firebase Firestore SDK:', err);
+    console.warn('[serverFirestore] Failed to initialize Firebase Admin Firestore:', err);
+    return null;
   }
-  return null;
 }
 
-export function getAllServerFirestoreDbs(): any[] {
-  const list: any[] = [];
-  const def = getDefaultFirestoreDb();
-  if (def) list.push(def);
-  const custom = getFirestoreDb();
-  if (custom && !list.includes(custom)) list.push(custom);
-  return list;
+export function getDefaultFirestoreDb(): Firestore | null {
+  return getFirestoreDb();
 }
 
-// Timeout helper so remote Firestore never blocks an Express API response
+export function getAllServerFirestoreDbs(): Firestore[] {
+  const db = getFirestoreDb();
+  return db ? [db] : [];
+}
+
+/**
+ * Testing helpers for injecting mocks and resetting state
+ */
+export function setFirebaseAdminFirestoreForTesting(mockDb: Firestore | null): void {
+  adminFirestoreInstance = mockDb;
+}
+
+export function resetFirebaseAdminFirestoreForTesting(): void {
+  adminFirestoreInstance = null;
+}
+
+// Timeout helper so remote Firestore never blocks an Express API response indefinitely
 function withTimeout<T>(promise: Promise<T>, ms: number = 1500): Promise<T | null> {
   let timer: NodeJS.Timeout;
   const timeoutPromise = new Promise<null>((resolve) => {
@@ -102,11 +80,11 @@ function withTimeout<T>(promise: Promise<T>, ms: number = 1500): Promise<T | nul
 }
 
 /**
- * Direct persistence for individual Native Friend / Tutor profiles in /tutors/{tutorId}
+ * Direct persistence for individual Native Friend / Tutor profiles in /tutors/{tutorId} and /users/{tutorId}
  */
 export async function saveTutorToFirestore(tutor: any): Promise<boolean> {
-  const dbs = getAllServerFirestoreDbs();
-  if (dbs.length === 0 || !tutor) return false;
+  const db = getFirestoreDb();
+  if (!db || !tutor) return false;
   try {
     const cleanEmail = (tutor.email || '').toLowerCase().trim();
     const tutorId = tutor.id || `tutor-${cleanEmail.replace(/[^a-zA-Z0-9]/g, '-')}`;
@@ -126,15 +104,14 @@ export async function saveTutorToFirestore(tutor: any): Promise<boolean> {
     }));
 
     const cleanEmailDocId = cleanEmail.replace(/[^a-zA-Z0-9]/g, '-');
-    const writePromises: Promise<any>[] = [];
+    const writePromises: Promise<any>[] = [
+      db.collection('users').doc(tutorId).set(sanitized, { merge: true }),
+      db.collection('tutors').doc(tutorId).set(sanitized, { merge: true }),
+    ];
 
-    for (const db of dbs) {
-      writePromises.push(setDoc(doc(db, 'users', tutorId), sanitized, { merge: true }).catch(() => null));
-      writePromises.push(setDoc(doc(db, 'tutors', tutorId), sanitized, { merge: true }).catch(() => null));
-      if (cleanEmailDocId !== tutorId) {
-        writePromises.push(setDoc(doc(db, 'users', cleanEmailDocId), sanitized, { merge: true }).catch(() => null));
-        writePromises.push(setDoc(doc(db, 'tutors', cleanEmailDocId), sanitized, { merge: true }).catch(() => null));
-      }
+    if (cleanEmailDocId && cleanEmailDocId !== tutorId) {
+      writePromises.push(db.collection('users').doc(cleanEmailDocId).set(sanitized, { merge: true }));
+      writePromises.push(db.collection('tutors').doc(cleanEmailDocId).set(sanitized, { merge: true }));
     }
 
     const savePromise = Promise.all(writePromises).then(() => true);
@@ -148,73 +125,69 @@ export async function saveTutorToFirestore(tutor: any): Promise<boolean> {
 
 /**
  * Fetch all Native Friend / Teacher profiles directly from unified /users collection (role == 'teacher')
- * with fallback to legacy /tutors collection across production and custom databases.
+ * with fallback to legacy /tutors collection.
  */
 export async function fetchTutorsFromFirestore(): Promise<any[]> {
-  const dbs = getAllServerFirestoreDbs();
-  if (dbs.length === 0) return [];
+  const db = getFirestoreDb();
+  if (!db) return [];
   try {
     const fetchPromise = async () => {
       const listMap = new Map<string, any>();
 
-      for (const db of dbs) {
-        try {
-          // Primary: query unified 'users' collection where role == 'teacher'
-          const teachersQuery = query(collection(db, 'users'), where('role', '==', 'teacher'));
-          const [usersSnap, legacySnap] = await Promise.all([
-            getDocs(teachersQuery).catch(() => null),
-            getDocs(collection(db, 'tutors')).catch(() => null),
-          ]);
+      try {
+        const [usersSnap, legacySnap] = await Promise.all([
+          db.collection('users').where('role', '==', 'teacher').get().catch(() => null),
+          db.collection('tutors').get().catch(() => null),
+        ]);
 
-          if (usersSnap) {
-            usersSnap.forEach((d) => {
-              const data = d.data();
-              if (data && (data.email || data.name)) {
-                const key = (data.email || d.id).toLowerCase().trim();
-                const existing = listMap.get(key) || {};
-                const isApproved =
-                  data.approvalStatus === 'approved' ||
-                  data.isApproved === true ||
-                  data.status === 'approved' ||
-                  data.approved === true ||
-                  existing.isApproved;
-                listMap.set(key, {
-                  ...existing,
-                  id: d.id,
-                  ...data,
-                  role: 'teacher',
-                  ...(isApproved ? { approvalStatus: 'approved', isApproved: true, status: 'approved', approved: true } : {}),
-                });
-              }
-            });
-          }
-
-          if (legacySnap) {
-            legacySnap.forEach((d) => {
-              const data = d.data();
-              if (data && (data.email || data.name)) {
-                const key = (data.email || d.id).toLowerCase().trim();
-                const existing = listMap.get(key) || {};
-                const isApproved =
-                  data.approvalStatus === 'approved' ||
-                  data.isApproved === true ||
-                  data.status === 'approved' ||
-                  data.approved === true ||
-                  existing.isApproved;
-                const merged = { ...data, ...existing, id: existing.id || d.id, role: 'teacher' };
-                if (isApproved) {
-                  merged.approvalStatus = 'approved';
-                  merged.isApproved = true;
-                  merged.status = 'approved';
-                  merged.approved = true;
-                }
-                listMap.set(key, merged);
-              }
-            });
-          }
-        } catch (dbErr) {
-          console.warn('Error reading tutors from one database instance:', dbErr);
+        if (usersSnap) {
+          usersSnap.forEach((d) => {
+            const data = d.data();
+            if (data && (data.email || data.name)) {
+              const key = (data.email || d.id).toLowerCase().trim();
+              const existing = listMap.get(key) || {};
+              const isApproved =
+                data.approvalStatus === 'approved' ||
+                data.isApproved === true ||
+                data.status === 'approved' ||
+                data.approved === true ||
+                existing.isApproved;
+              listMap.set(key, {
+                ...existing,
+                id: d.id,
+                ...data,
+                role: 'teacher',
+                ...(isApproved ? { approvalStatus: 'approved', isApproved: true, status: 'approved', approved: true } : {}),
+              });
+            }
+          });
         }
+
+        if (legacySnap) {
+          legacySnap.forEach((d) => {
+            const data = d.data();
+            if (data && (data.email || data.name)) {
+              const key = (data.email || d.id).toLowerCase().trim();
+              const existing = listMap.get(key) || {};
+              const isApproved =
+                data.approvalStatus === 'approved' ||
+                data.isApproved === true ||
+                data.status === 'approved' ||
+                data.approved === true ||
+                existing.isApproved;
+              const merged = { ...data, ...existing, id: existing.id || d.id, role: 'teacher' };
+              if (isApproved) {
+                merged.approvalStatus = 'approved';
+                merged.isApproved = true;
+                merged.status = 'approved';
+                merged.approved = true;
+              }
+              listMap.set(key, merged);
+            }
+          });
+        }
+      } catch (dbErr) {
+        console.warn('Error reading tutors from Firestore database:', dbErr);
       }
 
       const results = Array.from(listMap.values());
@@ -240,13 +213,41 @@ export async function deleteTutorFromFirestore(tutorId: string): Promise<boolean
   const db = getFirestoreDb();
   if (!db || !tutorId) return false;
   try {
-    const delFromUsers = deleteDoc(doc(db, 'users', tutorId)).catch(() => null);
-    const delFromTutors = deleteDoc(doc(db, 'tutors', tutorId)).catch(() => null);
+    const delFromUsers = db.collection('users').doc(tutorId).delete().catch(() => null);
+    const delFromTutors = db.collection('tutors').doc(tutorId).delete().catch(() => null);
     const delPromise = Promise.all([delFromUsers, delFromTutors]).then(() => true);
     const result = await withTimeout(delPromise, 6000);
     return !!result;
   } catch (err) {
     console.warn('Firestore deleteTutor error:', err);
+    return false;
+  }
+}
+
+/**
+ * Delete user records matching a target email or doc ID across the /users collection
+ */
+export async function deleteUserByEmailFromFirestore(targetEmail: string): Promise<boolean> {
+  const db = getFirestoreDb();
+  if (!db || !targetEmail) return false;
+  try {
+    const cleanEmail = targetEmail.toLowerCase().trim();
+    const snap = await db.collection('users').get();
+    const batch = db.batch();
+    let hasDeletions = false;
+    for (const d of snap.docs) {
+      const u = d.data();
+      if ((u.email || '').toLowerCase().trim() === cleanEmail || d.id.toLowerCase() === cleanEmail) {
+        batch.delete(d.ref);
+        hasDeletions = true;
+      }
+    }
+    if (hasDeletions) {
+      await batch.commit();
+    }
+    return true;
+  } catch (e) {
+    console.warn('Could not delete user from Firestore users collection:', e);
     return false;
   }
 }
@@ -257,8 +258,8 @@ export async function fetchAppStateFromFirestore(): Promise<any | null> {
   try {
     const fetchDoc = async (docName: string) => {
       try {
-        const snap = await getDoc(doc(db, 'app_state', docName));
-        return snap.exists() ? snap.data() : null;
+        const snap = await db.collection('app_state').doc(docName).get();
+        return snap.exists ? snap.data() : null;
       } catch {
         return null;
       }
@@ -393,8 +394,7 @@ export async function saveYouTubePlaylistsToFirestore(playlists: any[]): Promise
   if (!db || !Array.isArray(playlists)) return false;
   try {
     const sanitized = JSON.parse(JSON.stringify(playlists));
-    const savePromise = setDoc(
-      doc(db, 'app_state', 'youtube_playlists'),
+    const savePromise = db.collection('app_state').doc('youtube_playlists').set(
       {
         playlists: sanitized,
         count: sanitized.length,
@@ -415,8 +415,8 @@ export async function fetchYouTubePlaylistsFromFirestore(): Promise<any[] | null
   if (!db) return null;
   try {
     const fetchPromise = async () => {
-      const snap = await getDoc(doc(db, 'app_state', 'youtube_playlists'));
-      if (snap.exists()) {
+      const snap = await db.collection('app_state').doc('youtube_playlists').get();
+      if (snap.exists) {
         const data = snap.data();
         if (Array.isArray(data?.playlists)) {
           return data.playlists;
@@ -435,15 +435,12 @@ export async function saveAppStateToFirestore(data: any): Promise<boolean> {
   const db = getFirestoreDb();
   if (!db || !data) return false;
   try {
-    // Sanitize data: JSON roundtrip eliminates any undefined properties that cause Firestore setDoc to fail
     const sanitized = JSON.parse(JSON.stringify(data));
     const cachedYtPlaylists = Array.isArray(sanitized.youtubePlaylists) ? sanitized.youtubePlaylists : null;
 
-    // Strip out bulky external API caches that must not be stored in main Firestore documents
+    // Strip out external API caches that must not be stored in main Firestore documents
     delete sanitized.youtubePlaylists;
 
-    // Partition state into modular documents under /app_state/ so each document is well under 250 KB
-    // (Firestore has a strict maximum document limit of 1,048,576 bytes).
     const routinesData = {
       studentRoutinesMap: sanitized.studentRoutinesMap || {},
       studentCurrentRoutines: sanitized.studentCurrentRoutines || {},
@@ -480,7 +477,6 @@ export async function saveAppStateToFirestore(data: any): Promise<boolean> {
       updatedAt: new Date().toISOString(),
     };
 
-    // Keep core system & user settings in main_data, stripped of the partitioned collections
     const mainData = { ...sanitized };
     delete mainData.studentRoutinesMap;
     delete mainData.studentCurrentRoutines;
@@ -504,13 +500,12 @@ export async function saveAppStateToFirestore(data: any): Promise<boolean> {
     delete mainData.studentHomeworkMap;
     mainData.updatedAt = new Date().toISOString();
 
-    // Safe tutors preservation: never overwrite existing tutors with an empty list unless an explicit deletion was requested
     let tutorsDocToWrite = tutorsData;
     const hasIntentionalDeletion = Array.isArray(tutorsData.deletedTutorEmails) && tutorsData.deletedTutorEmails.length > 0;
     if ((!tutorsData.tutorsList || tutorsData.tutorsList.length === 0) && !hasIntentionalDeletion) {
       try {
-        const existingSnap = await getDoc(doc(db, 'app_state', 'tutors')).catch(() => null);
-        if (existingSnap && existingSnap.exists()) {
+        const existingSnap = await db.collection('app_state').doc('tutors').get().catch(() => null);
+        if (existingSnap && existingSnap.exists) {
           const exData = existingSnap.data();
           if (Array.isArray(exData?.tutorsList) && exData.tutorsList.length > 0) {
             tutorsDocToWrite = {
@@ -535,19 +530,19 @@ export async function saveAppStateToFirestore(data: any): Promise<boolean> {
           role: 'teacher',
           updatedAt: tut.updatedAt || new Date().toISOString(),
         };
-        const p1 = setDoc(doc(db, 'users', tId), teacherData, { merge: true }).catch(() => null);
-        const p2 = setDoc(doc(db, 'tutors', tId), teacherData, { merge: true }).catch(() => null);
+        const p1 = db.collection('users').doc(tId).set(teacherData, { merge: true }).catch(() => null);
+        const p2 = db.collection('tutors').doc(tId).set(teacherData, { merge: true }).catch(() => null);
         return Promise.all([p1, p2]);
       }
       return Promise.resolve();
     });
 
     const savePromises = Promise.all([
-      setDoc(doc(db, 'app_state', 'main_data'), mainData, { merge: true }),
-      setDoc(doc(db, 'app_state', 'routines'), routinesData, { merge: true }),
-      setDoc(doc(db, 'app_state', 'tutors'), tutorsDocToWrite, { merge: true }),
-      setDoc(doc(db, 'app_state', 'assignments'), assignmentsData, { merge: true }),
-      setDoc(doc(db, 'app_state', 'lessons'), lessonsData, { merge: true }),
+      db.collection('app_state').doc('main_data').set(mainData, { merge: true }),
+      db.collection('app_state').doc('routines').set(routinesData, { merge: true }),
+      db.collection('app_state').doc('tutors').set(tutorsDocToWrite, { merge: true }),
+      db.collection('app_state').doc('assignments').set(assignmentsData, { merge: true }),
+      db.collection('app_state').doc('lessons').set(lessonsData, { merge: true }),
       ...tutorSavePromises,
       ...(cachedYtPlaylists ? [saveYouTubePlaylistsToFirestore(cachedYtPlaylists)] : []),
     ]).then(() => true);
@@ -566,7 +561,6 @@ export async function saveUserToFirestore(user: any): Promise<boolean> {
   try {
     const sanitized = JSON.parse(JSON.stringify(user));
     const cleanEmail = user.email.toLowerCase().trim();
-    // Guarantee that documents in 'users' collection strictly use the Auth UID as document ID, not email or custom strings
     const docId = user.uid || (user.id && !user.id.includes('@') && !user.id.startsWith('usr-') ? user.id : '');
     if (!docId) {
       console.warn('saveUserToFirestore skipped: user has no valid Auth UID');
@@ -577,7 +571,7 @@ export async function saveUserToFirestore(user: any): Promise<boolean> {
     sanitized.uid = docId;
     sanitized.id = docId;
 
-    const savePromise = setDoc(doc(db, 'users', docId), sanitized, { merge: true });
+    const savePromise = db.collection('users').doc(docId).set(sanitized, { merge: true });
     const result = await withTimeout(savePromise.then(() => true), 10000);
     return !!result;
   } catch (err) {
@@ -591,7 +585,7 @@ export async function fetchUsersFromFirestore(): Promise<any[]> {
   if (!db) return [];
   try {
     const fetchPromise = async () => {
-      const snap = await getDocs(collection(db, 'users'));
+      const snap = await db.collection('users').get();
       const list: any[] = [];
       snap.forEach((d) => {
         const data = d.data();
@@ -621,17 +615,16 @@ export async function fetchUserFromFirestore(email: string, uid?: string): Promi
 
     const fetchPromise = (async () => {
       if (uid) {
-        const snapUid = await getDoc(doc(db, 'users', uid));
-        if (snapUid.exists()) return snapUid.data();
+        const snapUid = await db.collection('users').doc(uid).get();
+        if (snapUid.exists) return snapUid.data();
       }
       if (cleanDocId) {
-        const snapEmail = await getDoc(doc(db, 'users', cleanDocId));
-        if (snapEmail.exists()) return snapEmail.data();
+        const snapEmail = await db.collection('users').doc(cleanDocId).get();
+        if (snapEmail.exists) return snapEmail.data();
       }
       if (cleanEmail) {
         try {
-          const q = query(collection(db, 'users'), where('email', '==', cleanEmail));
-          const qSnap = await getDocs(q);
+          const qSnap = await db.collection('users').where('email', '==', cleanEmail).get();
           if (!qSnap.empty) {
             return qSnap.docs[0].data();
           }
@@ -653,8 +646,35 @@ export async function checkUserExistsInFirestore(email: string): Promise<boolean
 }
 
 /**
+ * Fast direct fetch of user document by docId (UID or sanitized email)
+ */
+export async function fetchUserDocumentFromFirestore(docId: string, timeoutMs: number = 500): Promise<any | null> {
+  const db = getFirestoreDb();
+  if (!db || !docId) return null;
+  try {
+    const snap = await withTimeout(db.collection('users').doc(docId).get(), timeoutMs);
+    return snap && snap.exists ? snap.data() : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Fast direct fetch of tutor document by docId (UID or tutor ID)
+ */
+export async function fetchTutorDocumentFromFirestore(docId: string, timeoutMs: number = 500): Promise<any | null> {
+  const db = getFirestoreDb();
+  if (!db || !docId) return null;
+  try {
+    const snap = await withTimeout(db.collection('tutors').doc(docId).get(), timeoutMs);
+    return snap && snap.exists ? snap.data() : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Dedicated persistence for Student Media Assignments (YouTube & Spotify) directly linked to UID.
- * Guarantees that even across reloads, disconnects, or new logins, the assigned content is retained in Firestore.
  */
 export async function saveStudentAssignmentsByUid(
   uid: string,
@@ -681,7 +701,7 @@ export async function saveStudentAssignmentsByUid(
       uid,
       updatedAt: data.updatedAt || new Date().toISOString(),
     }));
-    const savePromise = setDoc(doc(db, 'student_assignments', uid), sanitized, { merge: true }).then(() => true);
+    const savePromise = db.collection('student_assignments').doc(uid).set(sanitized, { merge: true }).then(() => true);
     const result = await withTimeout(savePromise, 2000);
     return !!result;
   } catch (err) {
@@ -694,8 +714,8 @@ export async function fetchStudentAssignmentsByUid(uid: string): Promise<any | n
   const db = getFirestoreDb();
   if (!db || !uid) return null;
   try {
-    const fetchPromise = getDoc(doc(db, 'student_assignments', uid)).then((snap) => {
-      if (snap.exists()) {
+    const fetchPromise = db.collection('student_assignments').doc(uid).get().then((snap) => {
+      if (snap.exists) {
         return snap.data();
       }
       return null;
@@ -709,7 +729,6 @@ export async function fetchStudentAssignmentsByUid(uid: string): Promise<any | n
 
 /**
  * Dedicated persistence for Teacher Availability Schedule directly linked to UID and Email.
- * Stores granular 30-min slots partitioned by day of week.
  */
 export async function saveTeacherAvailabilityToFirestore(
   uidOrEmail: string,
@@ -736,11 +755,10 @@ export async function saveTeacherAvailabilityToFirestore(
     }));
 
     const cleanDocId = uidOrEmail.toLowerCase().trim().replace(/[^a-zA-Z0-9_-]/g, '_');
-    const savePromise = setDoc(doc(db, 'teacher_availability', cleanDocId), sanitized, { merge: true }).then(() => true);
+    const savePromise = db.collection('teacher_availability').doc(cleanDocId).set(sanitized, { merge: true }).then(() => true);
 
-    // If teacher UID is present and different from cleanDocId, also mirror to UID doc
     if (data.uid && data.uid !== cleanDocId) {
-      setDoc(doc(db, 'teacher_availability', data.uid), sanitized, { merge: true }).catch(() => {});
+      db.collection('teacher_availability').doc(data.uid).set(sanitized, { merge: true }).catch(() => {});
     }
 
     const result = await withTimeout(savePromise, 2000);
@@ -756,14 +774,13 @@ export async function fetchTeacherAvailabilityFromFirestore(uidOrEmail: string):
   if (!db || !uidOrEmail) return null;
   try {
     const cleanDocId = uidOrEmail.toLowerCase().trim().replace(/[^a-zA-Z0-9_-]/g, '_');
-    const fetchPromise = getDoc(doc(db, 'teacher_availability', cleanDocId)).then(async (snap) => {
-      if (snap.exists()) {
+    const fetchPromise = db.collection('teacher_availability').doc(cleanDocId).get().then(async (snap) => {
+      if (snap.exists) {
         return snap.data();
       }
-      // If not found by cleanDocId and uidOrEmail is different, try directly
       if (uidOrEmail !== cleanDocId) {
-        const snapDirect = await getDoc(doc(db, 'teacher_availability', uidOrEmail));
-        if (snapDirect.exists()) return snapDirect.data();
+        const snapDirect = await db.collection('teacher_availability').doc(uidOrEmail).get();
+        if (snapDirect.exists) return snapDirect.data();
       }
       return null;
     });
@@ -790,7 +807,7 @@ export async function saveRoutineVideoSubcollection(
       dayOfWeek,
       updatedAt: data.updatedAt || new Date().toISOString(),
     }));
-    const savePromise = setDoc(doc(db, 'users', uid, 'routines', dayOfWeek), sanitized, { merge: true }).then(() => true);
+    const savePromise = db.collection('users').doc(uid).collection('routines').doc(dayOfWeek).set(sanitized, { merge: true }).then(() => true);
     const result = await withTimeout(savePromise, 2000);
     return !!result;
   } catch (err) {
@@ -811,8 +828,7 @@ export async function resetRepeatFlagsSubcollection(
   try {
     await Promise.all(
       days.map((day) =>
-        setDoc(
-          doc(db, 'users', uid, 'routines', day),
+        db.collection('users').doc(uid).collection('routines').doc(day).set(
           { isRepeatVideo: false, updatedAt: new Date().toISOString() },
           { merge: true }
         )
@@ -838,9 +854,9 @@ export async function addWatchedVideoToUserDoc(
   try {
     const cleanVid = (videoId || '').trim();
     const cleanTitle = (videoTitle || 'Daily Video Practice').trim();
-    const userRef = doc(db, 'users', uid);
-    const snap = await getDoc(userRef);
-    const existing = snap.exists() ? (snap.data().watchedVideosHistory || snap.data().watchedVideos || []) : [];
+    const userRef = db.collection('users').doc(uid);
+    const snap = await userRef.get();
+    const existing = snap.exists ? (snap.data()?.watchedVideosHistory || snap.data()?.watchedVideos || []) : [];
     const list = Array.isArray(existing) ? [...existing] : [];
 
     const alreadyExists = list.some((item) => {
@@ -858,7 +874,7 @@ export async function addWatchedVideoToUserDoc(
         videoTitle: cleanTitle,
         watchedAt: new Date().toISOString(),
       });
-      await setDoc(userRef, { watchedVideosHistory: list, updatedAt: new Date().toISOString() }, { merge: true });
+      await userRef.set({ watchedVideosHistory: list, updatedAt: new Date().toISOString() }, { merge: true });
     }
     return true;
   } catch (err) {
@@ -869,8 +885,6 @@ export async function addWatchedVideoToUserDoc(
 
 /**
  * Server-side persistent storage of student vocabulary in Cloud Firestore.
- * CUMULATIVE: Merges incoming words with existing words and writes both to the user doc
- * and the users/{uid}/vocabulary/{wordId} subcollection.
  */
 export async function saveStudentVocabularyToFirestoreServer(
   studentUid: string,
@@ -893,9 +907,9 @@ export async function saveStudentVocabularyToFirestoreServer(
     for (const docId of targetDocIds) {
       let existingList: any[] = [];
       try {
-        const userSnap = await getDoc(doc(db, 'users', docId));
-        if (userSnap.exists() && Array.isArray(userSnap.data()?.vocabulary)) {
-          existingList = userSnap.data().vocabulary;
+        const userSnap = await db.collection('users').doc(docId).get();
+        if (userSnap.exists && Array.isArray(userSnap.data()?.vocabulary)) {
+          existingList = userSnap.data()?.vocabulary;
         }
       } catch {}
 
@@ -911,13 +925,12 @@ export async function saveStudentVocabularyToFirestoreServer(
       });
       const accumulated = Array.from(map.values()).sort((a, b) => (a.word || '').localeCompare(b.word || ''));
 
-      await setDoc(doc(db, 'users', docId), { vocabulary: accumulated, updatedAt: new Date().toISOString() }, { merge: true });
+      await db.collection('users').doc(docId).set({ vocabulary: accumulated, updatedAt: new Date().toISOString() }, { merge: true });
 
       for (const item of sanitizedEntries) {
         if (item && item.word) {
           const wordDocId = (item.id || item.word).toLowerCase().trim().replace(/[^a-zA-Z0-9_-]/g, '_');
-          await setDoc(
-            doc(db, 'users', docId, 'vocabulary', wordDocId),
+          await db.collection('users').doc(docId).collection('vocabulary').doc(wordDocId).set(
             { ...item, studentUid: cleanUid, studentEmail: cleanEmail, updatedAt: new Date().toISOString() },
             { merge: true }
           );
@@ -933,10 +946,6 @@ export async function saveStudentVocabularyToFirestoreServer(
 
 /**
  * Server-side persistent storage of Native Friend In-Session Notes & Recommendations in Cloud Firestore.
- * Automatically saves document keyed by specific session date / ID:
- * 1. Under top-level /session_notes/{sessionKey}
- * 2. Under /users/{studentId}/session_notes/{sessionKey}
- * 3. In /lessons/{lessonId} if lessonId is present
  */
 export async function saveSessionNotesToFirestoreServer(
   sessionKey: string,
@@ -969,22 +978,19 @@ export async function saveSessionNotesToFirestoreServer(
     }));
 
     const savePromises: Promise<any>[] = [
-      setDoc(doc(db, 'session_notes', cleanKey), sanitized, { merge: true }),
+      db.collection('session_notes').doc(cleanKey).set(sanitized, { merge: true }),
     ];
 
-    // Mirror under student user record
     const studentId = data.studentUid || (data.studentEmail ? data.studentEmail.toLowerCase().trim().replace(/[^a-zA-Z0-9_-]/g, '_') : '');
     if (studentId) {
       savePromises.push(
-        setDoc(doc(db, 'users', studentId, 'session_notes', cleanKey), sanitized, { merge: true })
+        db.collection('users').doc(studentId).collection('session_notes').doc(cleanKey).set(sanitized, { merge: true })
       );
     }
 
-    // Mirror to lesson doc if lessonId is available
     if (data.lessonId) {
       savePromises.push(
-        setDoc(
-          doc(db, 'lessons', data.lessonId),
+        db.collection('lessons').doc(data.lessonId).set(
           {
             sessionNotesDocument: data.content,
             liveNotes: data.content,
@@ -1015,8 +1021,8 @@ export async function fetchSessionNotesFromFirestoreServer(sessionKey: string): 
   if (!db || !sessionKey) return null;
   try {
     const cleanKey = sessionKey.replace(/[^a-zA-Z0-9_-]/g, '_');
-    const snap = await getDoc(doc(db, 'session_notes', cleanKey));
-    if (snap.exists()) {
+    const snap = await db.collection('session_notes').doc(cleanKey).get();
+    if (snap.exists) {
       return snap.data();
     }
     return null;
@@ -1026,4 +1032,197 @@ export async function fetchSessionNotesFromFirestoreServer(sessionKey: string): 
   }
 }
 
+/**
+ * Direct persistence for Native Friend notes review progress
+ */
+export async function saveSessionNotesProgressToFirestore(key: string, cyclePayload: any): Promise<boolean> {
+  const db = getFirestoreDb();
+  if (!db || !key) return false;
+  try {
+    const sanitized = JSON.parse(JSON.stringify(cyclePayload));
+    const userRef = db.collection('users').doc(key);
+    const subRef = userRef.collection('session_notes').doc('review_cycle');
+    await Promise.all([
+      subRef.set(sanitized, { merge: true }),
+      userRef.set(
+        {
+          nativeNotesReview: sanitized,
+          updatedAt: sanitized.updatedAt || new Date().toISOString(),
+        },
+        { merge: true }
+      ),
+    ]);
+    return true;
+  } catch (err) {
+    console.warn('Firestore saveSessionNotesProgress error:', err);
+    return false;
+  }
+}
 
+/**
+ * Direct persistence for Student Journal entries to users/{docId}
+ */
+export async function saveStudentJournalToFirestore(docId: string, journal: any[]): Promise<boolean> {
+  const db = getFirestoreDb();
+  if (!db || !docId) return false;
+  try {
+    const sanitized = JSON.parse(JSON.stringify(journal || []));
+    await db.collection('users').doc(docId).set(
+      {
+        studentJournal: sanitized,
+        updatedAt: new Date().toISOString(),
+      },
+      { merge: true }
+    );
+    return true;
+  } catch (err) {
+    console.warn('Firestore saveStudentJournal error:', err);
+    return false;
+  }
+}
+
+/**
+ * Subcollection-scoped persistence for routine checks
+ */
+export async function fetchWeeklyChecksFromFirestore(
+  docIds: string[],
+  canonicalWeekId: string,
+  cycle: number
+): Promise<Record<string, boolean> | null> {
+  const db = getFirestoreDb();
+  if (!db || !docIds.length) return null;
+
+  for (const dId of docIds.filter(Boolean)) {
+    try {
+      const weekSnap = await db.collection('users').doc(dId).collection('weeklyChecks').doc(canonicalWeekId).get();
+      if (weekSnap.exists) {
+        const wData = weekSnap.data();
+        return {
+          ...(wData?.checks || {}),
+          ...(wData?.weeklyChecks || {}),
+          ...(wData?.sPathChecks || {}),
+        };
+      }
+    } catch {}
+  }
+
+  // Week 1 legacy backward compatibility only
+  if (cycle === 1) {
+    for (const dId of docIds.filter(Boolean)) {
+      try {
+        const userSnap = await db.collection('users').doc(dId).get();
+        if (userSnap.exists) {
+          const uData = userSnap.data();
+          if (uData?.weeklyChecks || uData?.sPathChecks) {
+            return {
+              ...(uData?.weeklyChecks || {}),
+              ...(uData?.sPathChecks || {}),
+            };
+          }
+        }
+      } catch {}
+    }
+  }
+
+  return null;
+}
+
+export async function saveWeeklyChecksToFirestore(
+  docId: string,
+  canonicalWeekId: string,
+  weekDocPayload: any,
+  fsRootPayload: any
+): Promise<boolean> {
+  const db = getFirestoreDb();
+  if (!db || !docId) return false;
+  try {
+    const userRef = db.collection('users').doc(docId);
+    const subRef = userRef.collection('weeklyChecks').doc(canonicalWeekId);
+    await Promise.all([
+      subRef.set(JSON.parse(JSON.stringify(weekDocPayload)), { merge: true }),
+      userRef.set(JSON.parse(JSON.stringify(fsRootPayload)), { merge: true }),
+    ]);
+    return true;
+  } catch (err) {
+    console.warn('Firestore saveWeeklyChecks error:', err);
+    return false;
+  }
+}
+
+/**
+ * Subcollection-scoped persistence for homework
+ */
+export async function fetchHomeworkFromFirestore(
+  docIds: string[],
+  canonicalWeekId: string,
+  cycle: number
+): Promise<any | null> {
+  const db = getFirestoreDb();
+  if (!db || !docIds.length) return null;
+
+  for (const dId of docIds.filter(Boolean)) {
+    try {
+      const hwSnap = await db.collection('users').doc(dId).collection('homework').doc(canonicalWeekId).get();
+      if (hwSnap.exists) {
+        return hwSnap.data();
+      }
+    } catch {}
+  }
+
+  // Week 1 legacy backward compatibility only
+  if (cycle === 1) {
+    for (const dId of docIds.filter(Boolean)) {
+      try {
+        const hwSubSnap = await db.collection('users').doc(dId).collection('homework').doc('current_week').get();
+        if (hwSubSnap.exists) {
+          return hwSubSnap.data();
+        }
+        const userSnap = await db.collection('users').doc(dId).get();
+        if (userSnap.exists && userSnap.data()?.weeklyHomework) {
+          return userSnap.data().weeklyHomework;
+        }
+      } catch {}
+    }
+  }
+
+  return null;
+}
+
+export async function saveHomeworkToFirestore(
+  docId: string,
+  canonicalWeekId: string,
+  cycle: number,
+  hwPayload: any
+): Promise<boolean> {
+  const db = getFirestoreDb();
+  if (!db || !docId) return false;
+  try {
+    const sanitized = JSON.parse(JSON.stringify(hwPayload));
+    const userRef = db.collection('users').doc(docId);
+    const promises: Promise<any>[] = [
+      userRef.collection('homework').doc(canonicalWeekId).set(sanitized, { merge: true }),
+    ];
+    if (cycle === 1) {
+      promises.push(
+        userRef.set(
+          {
+            weeklyHomework: sanitized,
+            updatedAt: new Date().toISOString(),
+          },
+          { merge: true }
+        )
+      );
+      promises.push(
+        userRef.collection('homework').doc('current_week').set(sanitized, { merge: true })
+      );
+      promises.push(
+        db.collection('student_homework').doc(docId).set(sanitized, { merge: true })
+      );
+    }
+    await Promise.all(promises);
+    return true;
+  } catch (err) {
+    console.warn('Firestore saveHomework error:', err);
+    return false;
+  }
+}

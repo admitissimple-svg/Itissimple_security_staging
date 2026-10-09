@@ -5,7 +5,6 @@ import dotenv from 'dotenv';
 dotenv.config();
 import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI, ThinkingLevel } from '@google/genai';
-import { doc, setDoc, getDoc, getDocs, collection, deleteDoc } from 'firebase/firestore';
 import {
   fetchAppStateFromFirestore,
   saveAppStateToFirestore,
@@ -28,6 +27,15 @@ import {
   saveTutorToFirestore,
   fetchTutorsFromFirestore,
   deleteTutorFromFirestore,
+  deleteUserByEmailFromFirestore,
+  saveSessionNotesProgressToFirestore,
+  saveStudentJournalToFirestore,
+  fetchUserDocumentFromFirestore,
+  fetchTutorDocumentFromFirestore,
+  fetchWeeklyChecksFromFirestore,
+  saveWeeklyChecksToFirestore,
+  fetchHomeworkFromFirestore,
+  saveHomeworkToFirestore,
 } from './src/serverFirestore';
 import { DEFAULT_CURATED_PLAYLISTS } from './src/utils/youtubeService';
 import {
@@ -4087,20 +4095,10 @@ app.delete('/api/students/:identifier', async (req, res) => {
   await writeDbSync(db);
 
   // Clean from Firestore users collection if present
-  const firestoreDb = getFirestoreDb();
-  if (firestoreDb && targetEmail) {
-    try {
-      const { deleteDoc, doc, getDocs, collection } = await import('firebase/firestore');
-      const usersSnap = await getDocs(collection(firestoreDb, 'users'));
-      for (const d of usersSnap.docs) {
-        const u = d.data();
-        if ((u.email || '').toLowerCase().trim() === targetEmail || d.id.toLowerCase() === targetEmail) {
-          await deleteDoc(doc(firestoreDb, 'users', d.id));
-        }
-      }
-    } catch (e) {
+  if (targetEmail) {
+    await deleteUserByEmailFromFirestore(targetEmail).catch((e) => {
       console.warn('Could not delete user from Firestore users collection:', e);
-    }
+    });
   }
 
   res.json({ success: true, message: 'Student profile deleted successfully', email: targetEmail });
@@ -6544,22 +6542,15 @@ app.post('/api/session-notes/progress', async (req, res) => {
   writeDb(db);
 
   // Direct atomic write to Cloud Firestore
-  const firestore = getFirestoreDb();
-  if (firestore) {
-    const cyclePayload = {
-      studentUid: studentUid || '',
-      studentEmail: (studentEmail || '').toLowerCase().trim(),
-      lastSessionKey: lastSessionKey || '',
-      stepIndex: typeof stepIndex === 'number' ? stepIndex : 0,
-      lastReviewedTab: lastReviewedTab || '',
-      updatedAt: new Date().toISOString(),
-    };
-    setDoc(doc(firestore, 'users', key, 'session_notes', 'review_cycle'), cyclePayload, { merge: true }).catch(() => {});
-    setDoc(doc(firestore, 'users', key), {
-      nativeNotesReview: cyclePayload,
-      updatedAt: new Date().toISOString(),
-    }, { merge: true }).catch(() => {});
-  }
+  const cyclePayload = {
+    studentUid: studentUid || '',
+    studentEmail: (studentEmail || '').toLowerCase().trim(),
+    lastSessionKey: lastSessionKey || '',
+    stepIndex: typeof stepIndex === 'number' ? stepIndex : 0,
+    lastReviewedTab: lastReviewedTab || '',
+    updatedAt: new Date().toISOString(),
+  };
+  saveSessionNotesProgressToFirestore(key, cyclePayload).catch(() => {});
 
   return res.json({ success: true, progress: db.sessionNotesProgressMap[key] });
 });
@@ -7325,19 +7316,9 @@ app.post('/api/student-journal', async (req, res) => {
   if (studentUid) db.studentJournalMap[studentUid] = updated;
 
   // Direct atomic write to Cloud Firestore by UID
-  const firestore = getFirestoreDb();
-  if (firestore) {
-    const docId = studentUid || cleanEmail;
-    if (docId) {
-      setDoc(
-        doc(firestore, 'users', docId),
-        {
-          studentJournal: updated,
-          updatedAt: new Date().toISOString(),
-        },
-        { merge: true }
-      ).catch(() => {});
-    }
+  const docId = studentUid || cleanEmail;
+  if (docId) {
+    saveStudentJournalToFirestore(docId, updated).catch(() => {});
   }
 
   await writeDbSync(db);
@@ -7399,19 +7380,9 @@ app.post('/api/student-journal/activity', async (req, res) => {
   }
 
   // Direct atomic write to Cloud Firestore by UID
-  const firestore = getFirestoreDb();
-  if (firestore) {
-    const docId = cleanUid || cleanEmail;
-    if (docId) {
-      setDoc(
-        doc(firestore, 'users', docId),
-        {
-          studentJournal: updated,
-          updatedAt: new Date().toISOString(),
-        },
-        { merge: true }
-      ).catch(() => {});
-    }
+  const docId = cleanUid || cleanEmail;
+  if (docId) {
+    saveStudentJournalToFirestore(docId, updated).catch(() => {});
   }
 
   await writeDbSync(db);
@@ -7439,19 +7410,9 @@ app.delete('/api/student-journal/activity', async (req, res) => {
   }
 
   // Direct atomic write to Cloud Firestore by UID
-  const firestoreDel = getFirestoreDb();
-  if (firestoreDel) {
-    const docId = cleanUid || cleanEmail;
-    if (docId) {
-      setDoc(
-        doc(firestoreDel, 'users', docId),
-        {
-          studentJournal: updated,
-          updatedAt: new Date().toISOString(),
-        },
-        { merge: true }
-      ).catch(() => {});
-    }
+  const docId = cleanUid || cleanEmail;
+  if (docId) {
+    saveStudentJournalToFirestore(docId, updated).catch(() => {});
   }
 
   await writeDbSync(db);
@@ -9523,19 +9484,15 @@ async function resolveStudentWeeklyCycle(studentUid?: string, studentEmail?: str
   }
 
   // 3. Check Firestore user document
-  const firestore = getFirestoreDb();
-  if (firestore) {
-    const docIds = [cleanUid, cleanEmail].filter(Boolean);
-    for (const docId of docIds) {
-      try {
-        const snap = await getDoc(doc(firestore, 'users', docId));
-        if (snap.exists()) {
-          const uData = snap.data();
-          const cycle = extractPositiveIntegerCycle(uData?.weeklyCycle);
-          if (cycle !== null) return cycle;
-        }
-      } catch {}
-    }
+  const docIds = [cleanUid, cleanEmail].filter(Boolean);
+  for (const docId of docIds) {
+    try {
+      const uData = await fetchUserDocumentFromFirestore(docId);
+      if (uData) {
+        const cycle = extractPositiveIntegerCycle(uData?.weeklyCycle);
+        if (cycle !== null) return cycle;
+      }
+    } catch {}
   }
 
   return null;
@@ -9570,16 +9527,6 @@ export interface StudentAuthResult {
  *    - Administrators may read and update student records.
  * 8. Denies access (403) if identity or assignment cannot be established.
  */
-async function safeFirestoreGetDoc(docRef: any, timeoutMs: number = 250): Promise<any | null> {
-  try {
-    return await Promise.race([
-      getDoc(docRef),
-      new Promise((_, reject) => setTimeout(() => reject(new Error('Firestore timeout')), timeoutMs)),
-    ]);
-  } catch {
-    return null;
-  }
-}
 
 interface AuthoritativeStudentRecord {
   uid: string;
@@ -9693,45 +9640,37 @@ async function queryAuthoritativeStudentRecords(
   }
 
   // 4. Firestore users collection (if available)
-  if (firestore) {
-    if (cleanUid) {
-      try {
-        const snap = await safeFirestoreGetDoc(doc(firestore, 'users', cleanUid));
-        if (snap && snap.exists()) {
-          const data = snap.data();
-          if (!data?.role || data.role === 'student') {
-            const fsUid = (data?.uid || data?.id || cleanUid).trim();
-            const fsEmail = (data?.email || '').toLowerCase().trim();
-            uidMatches.push({
-              uid: fsUid,
-              email: fsEmail,
-              teacherUid: (data?.teacherUid || data?.assignedTeacherId || '').trim(),
-              teacherEmail: (data?.teacherEmail || '').toLowerCase().trim(),
-              rawRecord: data,
-            });
-          }
-        }
-      } catch {}
-    }
-    if (cleanEmail && cleanEmail !== cleanUid) {
-      try {
-        const snap = await safeFirestoreGetDoc(doc(firestore, 'users', cleanEmail));
-        if (snap && snap.exists()) {
-          const data = snap.data();
-          if (!data?.role || data.role === 'student') {
-            const fsUid = (data?.uid || data?.id || '').trim();
-            const fsEmail = (data?.email || cleanEmail).toLowerCase().trim();
-            emailMatches.push({
-              uid: fsUid,
-              email: fsEmail,
-              teacherUid: (data?.teacherUid || data?.assignedTeacherId || '').trim(),
-              teacherEmail: (data?.teacherEmail || '').toLowerCase().trim(),
-              rawRecord: data,
-            });
-          }
-        }
-      } catch {}
-    }
+  if (cleanUid) {
+    try {
+      const data = await fetchUserDocumentFromFirestore(cleanUid, 250);
+      if (data && (!data?.role || data.role === 'student')) {
+        const fsUid = (data?.uid || data?.id || cleanUid).trim();
+        const fsEmail = (data?.email || '').toLowerCase().trim();
+        uidMatches.push({
+          uid: fsUid,
+          email: fsEmail,
+          teacherUid: (data?.teacherUid || data?.assignedTeacherId || '').trim(),
+          teacherEmail: (data?.teacherEmail || '').toLowerCase().trim(),
+          rawRecord: data,
+        });
+      }
+    } catch {}
+  }
+  if (cleanEmail && cleanEmail !== cleanUid) {
+    try {
+      const data = await fetchUserDocumentFromFirestore(cleanEmail, 250);
+      if (data && (!data?.role || data.role === 'student')) {
+        const fsUid = (data?.uid || data?.id || '').trim();
+        const fsEmail = (data?.email || cleanEmail).toLowerCase().trim();
+        emailMatches.push({
+          uid: fsUid,
+          email: fsEmail,
+          teacherUid: (data?.teacherUid || data?.assignedTeacherId || '').trim(),
+          teacherEmail: (data?.teacherEmail || '').toLowerCase().trim(),
+          rawRecord: data,
+        });
+      }
+    } catch {}
   }
 
   const candidateEmailsFromUid = Array.from(
@@ -9845,15 +9784,14 @@ export async function authorizeStudentAccess(
     );
 
     let isTeacherByFirestore = false;
-    const firestore = getFirestoreDb();
-    if (callerTokenRole !== 'teacher' && !isTeacherByTutors && !isTeacherByTeachers && !isTeacherByAuthUsers && firestore) {
+    if (callerTokenRole !== 'teacher' && !isTeacherByTutors && !isTeacherByTeachers && !isTeacherByAuthUsers) {
       try {
-        const tSnap = await safeFirestoreGetDoc(doc(firestore, 'users', callerUid));
-        if (tSnap && tSnap.exists() && tSnap.data()?.role === 'teacher') {
+        const tData = await fetchUserDocumentFromFirestore(callerUid, 250);
+        if (tData && tData.role === 'teacher') {
           isTeacherByFirestore = true;
         } else {
-          const tutSnap = await safeFirestoreGetDoc(doc(firestore, 'tutors', callerUid));
-          if (tutSnap && tutSnap.exists()) {
+          const tutData = await fetchTutorDocumentFromFirestore(callerUid, 250);
+          if (tutData) {
             isTeacherByFirestore = true;
           }
         }
@@ -10324,48 +10262,13 @@ app.get('/api/routines/weekly-checks', firebaseAuthMiddleware, async (req, res) 
     (db.studentWeeklyChecks && (db.studentWeeklyChecks[weekScopedKey] || (emailScopedKey ? db.studentWeeklyChecks[emailScopedKey] : undefined))) || null;
 
   // If not found in-memory, query Firestore week subcollection
-  const firestore = getFirestoreDb();
-  if (!checks && firestore) {
+  if (!checks) {
     const docIds = [cleanUid, cleanEmail].filter(Boolean);
-    for (const dId of docIds) {
-      try {
-        const weekSnap = await getDoc(doc(firestore, 'users', dId, 'weeklyChecks', canonicalWeekId));
-        if (weekSnap.exists()) {
-          const wData = weekSnap.data();
-          checks = {
-            ...(wData?.checks || {}),
-            ...(wData?.weeklyChecks || {}),
-            ...(wData?.sPathChecks || {}),
-          };
-          if (!db.studentWeeklyChecks) db.studentWeeklyChecks = {};
-          db.studentWeeklyChecks[weekScopedKey] = checks;
-          break;
-        }
-      } catch {}
-    }
-  }
-
-  // Week 1 legacy backward compatibility only:
-  if (!checks && cycle === 1) {
-    checks =
-      (db.studentWeeklyChecks && (db.studentWeeklyChecks[studentKey] || (cleanEmail ? db.studentWeeklyChecks[cleanEmail] : undefined))) || null;
-    if (!checks && firestore) {
-      const docIds = [cleanUid, cleanEmail].filter(Boolean);
-      for (const dId of docIds) {
-        try {
-          const userSnap = await getDoc(doc(firestore, 'users', dId));
-          if (userSnap.exists()) {
-            const uData = userSnap.data();
-            if (uData?.weeklyChecks || uData?.sPathChecks) {
-              checks = {
-                ...(uData?.weeklyChecks || {}),
-                ...(uData?.sPathChecks || {}),
-              };
-              break;
-            }
-          }
-        } catch {}
-      }
+    const fsChecks = await fetchWeeklyChecksFromFirestore(docIds, canonicalWeekId, cycle);
+    if (fsChecks) {
+      checks = fsChecks;
+      if (!db.studentWeeklyChecks) db.studentWeeklyChecks = {};
+      db.studentWeeklyChecks[weekScopedKey] = checks;
     }
   }
 
@@ -10489,10 +10392,8 @@ app.post('/api/routines/weekly-checks', firebaseAuthMiddleware, async (req, res)
   writeDb(db);
 
   // Firestore persistence
-  const firestore = getFirestoreDb();
-  if (firestore) {
-    const docId = cleanUid || cleanEmail;
-
+  const docId = cleanUid || cleanEmail;
+  if (docId) {
     // 1. Write week-specific document: users/{docId}/weeklyChecks/week-${cycle}
     const weekDocPayload: Record<string, any> = {
       id: canonicalWeekId,
@@ -10511,7 +10412,6 @@ app.post('/api/routines/weekly-checks', firebaseAuthMiddleware, async (req, res)
     if (typeof weeklyStudyDaysTarget === 'number') {
       weekDocPayload.weeklyStudyDaysTarget = weeklyStudyDaysTarget;
     }
-    setDoc(doc(firestore, 'users', docId, 'weeklyChecks', canonicalWeekId), weekDocPayload, { merge: true }).catch(() => {});
 
     // 2. Root document users/{docId}: targets always update;
     // Objective 4: Remove Week 2+ writes to root-level users/{uid}.weeklyChecks and sPathChecks.
@@ -10534,7 +10434,8 @@ app.post('/api/routines/weekly-checks', firebaseAuthMiddleware, async (req, res)
     if (Array.isArray(weeklyStudyDays)) {
       fsRootPayload.weeklyStudyDays = weeklyStudyDays;
     }
-    setDoc(doc(firestore, 'users', docId), fsRootPayload, { merge: true }).catch(() => {});
+
+    saveWeeklyChecksToFirestore(docId, canonicalWeekId, weekDocPayload, fsRootPayload).catch(() => {});
   }
 
   const savedChecks = db.studentWeeklyChecks[weekScopedKey] || {};
@@ -10591,42 +10492,13 @@ app.get('/api/homework', firebaseAuthMiddleware, async (req, res) => {
     (db.studentHomeworkMap && (db.studentHomeworkMap[hwScopedKey] || (emailScopedKey ? db.studentHomeworkMap[emailScopedKey] : undefined))) || null;
 
   // If not found in-memory, query Firestore week subcollection
-  const firestore = getFirestoreDb();
-  if (!hwData && firestore) {
+  if (!hwData) {
     const docIds = [cleanUid, cleanEmail].filter(Boolean);
-    for (const dId of docIds) {
-      try {
-        const hwSnap = await getDoc(doc(firestore, 'users', dId, 'homework', canonicalWeekId));
-        if (hwSnap.exists()) {
-          hwData = hwSnap.data();
-          if (!db.studentHomeworkMap) db.studentHomeworkMap = {};
-          db.studentHomeworkMap[hwScopedKey] = hwData;
-          break;
-        }
-      } catch {}
-    }
-  }
-
-  // Week 1 legacy backward compatibility only:
-  if (!hwData && cycle === 1) {
-    hwData =
-      (db.studentHomeworkMap && (db.studentHomeworkMap[studentKey] || (cleanEmail ? db.studentHomeworkMap[cleanEmail] : undefined))) || null;
-    if (!hwData && firestore) {
-      const docIds = [cleanUid, cleanEmail].filter(Boolean);
-      for (const dId of docIds) {
-        try {
-          const hwSubSnap = await getDoc(doc(firestore, 'users', dId, 'homework', 'current_week'));
-          if (hwSubSnap.exists()) {
-            hwData = hwSubSnap.data();
-            break;
-          }
-          const userSnap = await getDoc(doc(firestore, 'users', dId));
-          if (userSnap.exists() && userSnap.data()?.weeklyHomework) {
-            hwData = userSnap.data().weeklyHomework;
-            break;
-          }
-        } catch {}
-      }
+    const fsHw = await fetchHomeworkFromFirestore(docIds, canonicalWeekId, cycle);
+    if (fsHw) {
+      hwData = fsHw;
+      if (!db.studentHomeworkMap) db.studentHomeworkMap = {};
+      db.studentHomeworkMap[hwScopedKey] = hwData;
     }
   }
 
@@ -10711,23 +10583,9 @@ app.post(['/api/homework', '/api/homework/submit'], firebaseAuthMiddleware, asyn
   writeDb(db);
 
   // Firestore persistence
-  const firestore = getFirestoreDb();
-  if (firestore) {
-    const docId = cleanUid || cleanEmail;
-
-    // 1. Save strictly to week-scoped subcollection: users/{docId}/homework/week-${cycle}
-    setDoc(doc(firestore, 'users', docId, 'homework', canonicalWeekId), hwPayload, { merge: true }).catch(() => {});
-
-    // 2. Week 1 backward compatibility only:
-    if (cycle === 1) {
-      setDoc(doc(firestore, 'users', docId), {
-        weeklyHomework: hwPayload,
-        updatedAt: new Date().toISOString(),
-      }, { merge: true }).catch(() => {});
-      setDoc(doc(firestore, 'users', docId, 'homework', 'current_week'), hwPayload, { merge: true }).catch(() => {});
-      setDoc(doc(firestore, 'student_homework', docId), hwPayload, { merge: true }).catch(() => {});
-    }
-    // For cycle >= 2: REMOVE writes to root users/{docId}.weeklyHomework and homework/current_week!
+  const docId = cleanUid || cleanEmail;
+  if (docId) {
+    saveHomeworkToFirestore(docId, canonicalWeekId, cycle, hwPayload).catch(() => {});
   }
 
   res.json({
