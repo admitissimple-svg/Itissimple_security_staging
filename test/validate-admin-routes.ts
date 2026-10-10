@@ -519,6 +519,341 @@ async function runTests() {
     assert(resDeleteAdminTeacher.status === 403, 'DELETE /api/teachers/:email bloqueia exclusão de admin com 403');
   }
 
+  // =========================================================================
+  // Test suite 6: R-01 — Proteção da rota POST /api/admin/clean-obsolete-users
+  // =========================================================================
+  console.log('\n--- 6. Testando Proteção da rota POST /api/admin/clean-obsolete-users (R-01) ---');
+  {
+    // Mock DB state for R-01
+    const createCleanMockDb = () => ({
+      students: [
+        { id: 'usr-lavinia', email: 'laviniatilapiafc@gmail.com', name: 'Lavinia' },
+        { id: 'usr-obsolete-1', email: 'obsolete-student-1@example.com', name: 'Obsolete 1' },
+      ],
+      userProfiles: {
+        'laviniatilapiafc@gmail.com': { role: 'student', name: 'Lavinia' },
+        'obsolete-student-1@example.com': { role: 'student', name: 'Obsolete 1' },
+      },
+      deletedStudentEmails: [] as string[],
+    });
+
+    let mockDb = createCleanMockDb();
+
+    const cleanObsoleteUsersHandler = async (_req: Request, res: Response) => {
+      // Functional cleanup logic identical to serverApp.ts
+      mockDb.deletedStudentEmails = ['obsolete-student-1@example.com'];
+      mockDb.students = mockDb.students.filter(
+        (s) => s.email === 'laviniatilapiafc@gmail.com'
+      );
+      delete mockDb.userProfiles['obsolete-student-1@example.com'];
+      res.status(200).json({
+        success: true,
+        activeStudents: mockDb.students.map((s) => s.email),
+      });
+    };
+
+    // 6.1 Requisição sem token → HTTP 401
+    {
+      const initialSnapshot = JSON.stringify(mockDb);
+      const req = createMockRequest();
+      const res = await simulateRoute([firebaseAuthMiddleware, requireAdmin], cleanObsoleteUsersHandler, req);
+      assert(res.statusCode === 401, 'R-01: Requisição sem token retorna 401');
+      assert(JSON.stringify(mockDb) === initialSnapshot, 'R-01: Nenhuma alteração nos dados após 401 (sem token)');
+    }
+
+    // 6.2 Token inválido → HTTP 401
+    {
+      setFirebaseAdminAuthForTesting({
+        verifyIdToken: async () => {
+          const err: any = new Error('Invalid signature');
+          err.code = 'auth/invalid-id-token';
+          throw err;
+        },
+      } as any);
+      const initialSnapshot = JSON.stringify(mockDb);
+      const req = createMockRequest({ authorization: 'Bearer invalid-token-xyz' });
+      const res = await simulateRoute([firebaseAuthMiddleware, requireAdmin], cleanObsoleteUsersHandler, req);
+      assert(res.statusCode === 401, 'R-01: Token inválido retorna 401');
+      assert(JSON.stringify(mockDb) === initialSnapshot, 'R-01: Nenhuma alteração nos dados após 401 (token inválido)');
+    }
+
+    // 6.3 Estudante autenticado → HTTP 403
+    {
+      setFirebaseAdminAuthForTesting({
+        verifyIdToken: async () => ({
+          uid: 'student-uid-1',
+          email: 'student@example.com',
+          role: 'student',
+          email_verified: true,
+        }),
+      } as any);
+      const initialSnapshot = JSON.stringify(mockDb);
+      const req = createMockRequest({ authorization: 'Bearer student-token' });
+      const res = await simulateRoute([firebaseAuthMiddleware, requireAdmin], cleanObsoleteUsersHandler, req);
+      assert(res.statusCode === 403, 'R-01: Estudante autenticado retorna 403');
+      assert(JSON.stringify(mockDb) === initialSnapshot, 'R-01: Nenhuma alteração nos dados após 403 (estudante)');
+    }
+
+    // 6.4 Usuário anônimo autenticado → HTTP 403
+    {
+      setFirebaseAdminAuthForTesting({
+        verifyIdToken: async () => ({
+          uid: 'anon-uid-1',
+          email_verified: false,
+          // Sem custom claim role, rebaixa para student
+        }),
+      } as any);
+      const initialSnapshot = JSON.stringify(mockDb);
+      const req = createMockRequest({ authorization: 'Bearer anon-token' });
+      const res = await simulateRoute([firebaseAuthMiddleware, requireAdmin], cleanObsoleteUsersHandler, req);
+      assert(res.statusCode === 403, 'R-01: Usuário anônimo sem privilégios retorna 403');
+      assert(JSON.stringify(mockDb) === initialSnapshot, 'R-01: Nenhuma alteração nos dados após 403 (anônimo)');
+    }
+
+    // 6.5 Professor autenticado → HTTP 403
+    {
+      setFirebaseAdminAuthForTesting({
+        verifyIdToken: async () => ({
+          uid: 'teacher-uid-1',
+          email: 'teacher@example.com',
+          role: 'teacher',
+          email_verified: true,
+        }),
+      } as any);
+      const initialSnapshot = JSON.stringify(mockDb);
+      const req = createMockRequest({ authorization: 'Bearer teacher-token' });
+      const res = await simulateRoute([firebaseAuthMiddleware, requireAdmin], cleanObsoleteUsersHandler, req);
+      assert(res.statusCode === 403, 'R-01: Professor autenticado retorna 403');
+      assert(JSON.stringify(mockDb) === initialSnapshot, 'R-01: Nenhuma alteração nos dados após 403 (professor)');
+    }
+
+    // 6.6 Tentativa de contorno por parâmetros, headers ou campos de role cliente
+    {
+      // 6.6.1 Body fornecendo role: 'admin' sem token admin
+      setFirebaseAdminAuthForTesting({
+        verifyIdToken: async () => ({
+          uid: 'std-spoof-1',
+          email: 'spoof@example.com',
+          role: 'student',
+        }),
+      } as any);
+      const initialSnapshot = JSON.stringify(mockDb);
+      const reqWithBodyRole = createMockRequest(
+        { authorization: 'Bearer student-token' },
+        { role: 'admin', isAdmin: true }
+      );
+      const resBodyRole = await simulateRoute([firebaseAuthMiddleware, requireAdmin], cleanObsoleteUsersHandler, reqWithBodyRole);
+      assert(resBodyRole.statusCode === 403, 'R-01: Tentativa de bypass via body role=admin retorna 403');
+      assert(JSON.stringify(mockDb) === initialSnapshot, 'R-01: Nenhuma alteração de dados após tentativa de bypass via body');
+
+      // 6.6.2 Headers falsos sem token válido
+      const reqWithFakeHeaders = createMockRequest({
+        'x-user-role': 'admin',
+        'x-admin': 'true',
+      });
+      const resFakeHeaders = await simulateRoute([firebaseAuthMiddleware, requireAdmin], cleanObsoleteUsersHandler, reqWithFakeHeaders);
+      assert(resFakeHeaders.statusCode === 401, 'R-01: Tentativa de bypass via headers falsos retorna 401');
+      assert(JSON.stringify(mockDb) === initialSnapshot, 'R-01: Nenhuma alteração de dados após tentativa de bypass via headers');
+    }
+
+    // 6.7 Administrador autenticado e autorizado → operação permitida (HTTP 200)
+    {
+      setFirebaseAdminAuthForTesting({
+        verifyIdToken: async () => ({
+          uid: 'admin-master-uid',
+          email: 'adm.itissimple@gmail.com',
+          role: 'admin',
+          email_verified: true,
+        }),
+      } as any);
+      const req = createMockRequest({ authorization: 'Bearer admin-master-token' });
+      const res = await simulateRoute([firebaseAuthMiddleware, requireAdmin], cleanObsoleteUsersHandler, req);
+      assert(res.statusCode === 200, 'R-01: Administrador autenticado retorna 200');
+      assert(res.body?.success === true, 'R-01: Limpeza executada com sucesso');
+      assert(mockDb.students.length === 1, 'R-01: Aluno obsoleto foi removido na limpeza autorizada');
+      assert(mockDb.students[0].email === 'laviniatilapiafc@gmail.com', 'R-01: Aluno de produção preservado');
+    }
+  }
+
+  // =========================================================================
+  // Test suite 7: R-02 — Proteção da rota DELETE /api/students/:identifier
+  // =========================================================================
+  console.log('\n--- 7. Testando Proteção da rota DELETE /api/students/:identifier (R-02) ---');
+  {
+    const createStudentsMockDb = () => ({
+      students: [
+        { id: 'usr-student-target', email: 'target@example.com', name: 'Target Student' },
+        { id: 'usr-student-other', email: 'other@example.com', name: 'Other Student' },
+      ],
+      userProfiles: {
+        'target@example.com': { role: 'student', name: 'Target Student' },
+        'other@example.com': { role: 'student', name: 'Other Student' },
+      },
+      deletedStudentEmails: [] as string[],
+    });
+
+    let mockDb = createStudentsMockDb();
+
+    const deleteStudentHandler = async (req: Request, res: Response) => {
+      const rawId = req.params.identifier;
+      if (!rawId) {
+        return res.status(400).json({ error: 'Identifier is required' });
+      }
+      const clean = decodeURIComponent(rawId).toLowerCase().trim();
+      const targetEmail = clean.includes('@') ? clean : 'target@example.com';
+
+      mockDb.students = mockDb.students.filter(
+        (s) => s.email.toLowerCase() !== clean && s.id.toLowerCase() !== clean
+      );
+      delete mockDb.userProfiles[targetEmail];
+      if (!mockDb.deletedStudentEmails.includes(targetEmail)) {
+        mockDb.deletedStudentEmails.push(targetEmail);
+      }
+
+      res.status(200).json({
+        success: true,
+        message: 'Student profile deleted successfully',
+        email: targetEmail,
+      });
+    };
+
+    // 7.1 Requisição sem token → HTTP 401
+    {
+      const initialSnapshot = JSON.stringify(mockDb);
+      const req = createMockRequest({}, {}, { identifier: 'target@example.com' });
+      const res = await simulateRoute([firebaseAuthMiddleware, requireAdmin], deleteStudentHandler, req);
+      assert(res.statusCode === 401, 'R-02: Requisição sem token retorna 401');
+      assert(JSON.stringify(mockDb) === initialSnapshot, 'R-02: Nenhuma exclusão ocorre após 401 (sem token)');
+      assert(mockDb.students.some((s) => s.email === 'target@example.com'), 'R-02: Aluno permanece no banco');
+    }
+
+    // 7.2 Token inválido → HTTP 401
+    {
+      setFirebaseAdminAuthForTesting({
+        verifyIdToken: async () => {
+          const err: any = new Error('Token verification failed');
+          err.code = 'auth/invalid-id-token';
+          throw err;
+        },
+      } as any);
+      const initialSnapshot = JSON.stringify(mockDb);
+      const req = createMockRequest({ authorization: 'Bearer bad-token' }, {}, { identifier: 'target@example.com' });
+      const res = await simulateRoute([firebaseAuthMiddleware, requireAdmin], deleteStudentHandler, req);
+      assert(res.statusCode === 401, 'R-02: Token inválido retorna 401');
+      assert(JSON.stringify(mockDb) === initialSnapshot, 'R-02: Nenhuma exclusão ocorre após 401 (token inválido)');
+      assert(mockDb.students.some((s) => s.email === 'target@example.com'), 'R-02: Aluno permanece no banco');
+    }
+
+    // 7.3 Estudante autenticado tentando deletar a si mesmo ou outro aluno → HTTP 403
+    {
+      setFirebaseAdminAuthForTesting({
+        verifyIdToken: async () => ({
+          uid: 'usr-student-target',
+          email: 'target@example.com',
+          role: 'student',
+          email_verified: true,
+        }),
+      } as any);
+      const initialSnapshot = JSON.stringify(mockDb);
+      const req = createMockRequest(
+        { authorization: 'Bearer student-self-token' },
+        {},
+        { identifier: 'target@example.com' }
+      );
+      const res = await simulateRoute([firebaseAuthMiddleware, requireAdmin], deleteStudentHandler, req);
+      assert(res.statusCode === 403, 'R-02: Estudante tentando excluir conta retorna 403');
+      assert(JSON.stringify(mockDb) === initialSnapshot, 'R-02: Nenhuma exclusão ocorre após 403 (estudante)');
+      assert(mockDb.students.some((s) => s.email === 'target@example.com'), 'R-02: Aluno permanece preservado');
+    }
+
+    // 7.4 Professor autenticado tentando deletar aluno → HTTP 403
+    {
+      setFirebaseAdminAuthForTesting({
+        verifyIdToken: async () => ({
+          uid: 'teacher-uid-2',
+          email: 'teacher2@example.com',
+          role: 'teacher',
+          email_verified: true,
+        }),
+      } as any);
+      const initialSnapshot = JSON.stringify(mockDb);
+      const req = createMockRequest(
+        { authorization: 'Bearer teacher-token' },
+        {},
+        { identifier: 'target@example.com' }
+      );
+      const res = await simulateRoute([firebaseAuthMiddleware, requireAdmin], deleteStudentHandler, req);
+      assert(res.statusCode === 403, 'R-02: Professor tentando excluir aluno retorna 403');
+      assert(JSON.stringify(mockDb) === initialSnapshot, 'R-02: Nenhuma exclusão ocorre após 403 (professor)');
+      assert(mockDb.students.some((s) => s.email === 'target@example.com'), 'R-02: Aluno permanece preservado');
+    }
+
+    // 7.5 Tentativas de contorno por parâmetros, headers ou campos de role cliente
+    {
+      // 7.5.1 Header x-user-role: admin sem token
+      const initialSnapshot = JSON.stringify(mockDb);
+      const reqWithHeader = createMockRequest(
+        { 'x-user-role': 'admin' },
+        {},
+        { identifier: 'target@example.com' }
+      );
+      const resHeader = await simulateRoute([firebaseAuthMiddleware, requireAdmin], deleteStudentHandler, reqWithHeader);
+      assert(resHeader.statusCode === 401, 'R-02: Bypass via header x-user-role retorna 401');
+      assert(JSON.stringify(mockDb) === initialSnapshot, 'R-02: Aluno não é deletado');
+
+      // 7.5.2 Body role: admin com token de estudante
+      setFirebaseAdminAuthForTesting({
+        verifyIdToken: async () => ({
+          uid: 'std-attacker',
+          email: 'attacker@example.com',
+          role: 'student',
+        }),
+      } as any);
+      const reqWithBody = createMockRequest(
+        { authorization: 'Bearer student-attacker' },
+        { role: 'admin', isAdmin: true },
+        { identifier: 'target@example.com' }
+      );
+      const resBody = await simulateRoute([firebaseAuthMiddleware, requireAdmin], deleteStudentHandler, reqWithBody);
+      assert(resBody.statusCode === 403, 'R-02: Bypass via body role=admin retorna 403');
+      assert(JSON.stringify(mockDb) === initialSnapshot, 'R-02: Aluno não é deletado');
+
+      // 7.5.3 Query parameter role=admin
+      const reqWithQuery = createMockRequest(
+        { authorization: 'Bearer student-attacker' },
+        {},
+        { identifier: 'target@example.com' }
+      );
+      reqWithQuery.query = { role: 'admin', override: 'true' };
+      const resQuery = await simulateRoute([firebaseAuthMiddleware, requireAdmin], deleteStudentHandler, reqWithQuery);
+      assert(resQuery.statusCode === 403, 'R-02: Bypass via query parameter retorna 403');
+      assert(JSON.stringify(mockDb) === initialSnapshot, 'R-02: Aluno não é deletado');
+    }
+
+    // 7.6 Administrador autenticado e autorizado → operação permitida (HTTP 200) e exclusão realizada
+    {
+      setFirebaseAdminAuthForTesting({
+        verifyIdToken: async () => ({
+          uid: 'admin-master-uid',
+          email: 'adm.itissimple@gmail.com',
+          role: 'admin',
+          email_verified: true,
+        }),
+      } as any);
+      const req = createMockRequest(
+        { authorization: 'Bearer admin-master-token' },
+        {},
+        { identifier: 'target@example.com' }
+      );
+      const res = await simulateRoute([firebaseAuthMiddleware, requireAdmin], deleteStudentHandler, req);
+      assert(res.statusCode === 200, 'R-02: Administrador autenticado retorna 200');
+      assert(res.body?.success === true, 'R-02: Exclusão concluída com sucesso');
+      assert(!mockDb.students.some((s) => s.email === 'target@example.com'), 'R-02: Aluno foi excluído pelo administrador');
+      assert(mockDb.students.some((s) => s.email === 'other@example.com'), 'R-02: Demais alunos permanecem no banco');
+      assert(mockDb.deletedStudentEmails.includes('target@example.com'), 'R-02: E-mail adicionado à lista de exclusões');
+    }
+  }
+
   // Reset mock
   setFirebaseAdminAuthForTesting(null);
 

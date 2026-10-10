@@ -3910,7 +3910,7 @@ app.get('/api/students', (req, res) => {
 });
 
 // Dedicated maintenance endpoint to purge obsolete users and sanitize Firestore app_state
-app.post('/api/admin/clean-obsolete-users', async (_req, res) => {
+app.post('/api/admin/clean-obsolete-users', firebaseAuthMiddleware, requireAdmin, async (_req, res) => {
   try {
     const db = readDb();
     console.log('[CLEANUP] Starting cleanup of obsolete users...');
@@ -4036,7 +4036,7 @@ app.post('/api/students', (req, res) => {
   res.json(db.students);
 });
 
-app.delete('/api/students/:identifier', async (req, res) => {
+app.delete('/api/students/:identifier', firebaseAuthMiddleware, requireAdmin, async (req, res) => {
   const db = readDb();
   const rawId = req.params.identifier;
   if (!rawId) {

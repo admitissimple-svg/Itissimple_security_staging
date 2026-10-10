@@ -258,8 +258,8 @@ export async function fetchAppStateFromFirestore(): Promise<any | null> {
   try {
     const fetchDoc = async (docName: string) => {
       try {
-        const snap = await db.collection('app_state').doc(docName).get();
-        return snap.exists ? snap.data() : null;
+        const snap = await db.collection('app_state').doc(docName).get().catch(() => null);
+        return snap && snap.exists ? snap.data() : null;
       } catch {
         return null;
       }
@@ -383,8 +383,14 @@ export async function fetchAppStateFromFirestore(): Promise<any | null> {
       };
     });
     return await withTimeout(fetchAllPromise, 15000);
-  } catch (err) {
-    console.warn('Firestore fetchAppState error:', err);
+  } catch (err: any) {
+    const isPerm =
+      err?.code === 7 ||
+      err?.code === 'permission-denied' ||
+      String(err?.message || '').includes('PERMISSION_DENIED');
+    if (!isPerm) {
+      console.info('[serverFirestore] fetchAppState notice:', err?.message || String(err));
+    }
   }
   return null;
 }
@@ -585,9 +591,22 @@ export async function fetchUsersFromFirestore(): Promise<any[]> {
   if (!db) return [];
   try {
     const fetchPromise = async () => {
-      const snap = await db.collection('users').get();
+      const snap = await db.collection('users').get().catch((queryErr: any) => {
+        const isPerm =
+          queryErr?.code === 7 ||
+          queryErr?.code === 'permission-denied' ||
+          String(queryErr?.message || '').includes('PERMISSION_DENIED') ||
+          String(queryErr?.message || '').includes('Missing or insufficient permissions');
+        if (isPerm) {
+          console.info('[serverFirestore] Users collection read restricted by cloud IAM credentials, continuing with local state.');
+        } else {
+          console.info('[serverFirestore] Users collection query notice:', queryErr?.message || String(queryErr));
+        }
+        return null;
+      });
+      if (!snap) return [];
       const list: any[] = [];
-      snap.forEach((d) => {
+      snap.forEach((d: any) => {
         const data = d.data();
         if (data && (data.email || data.id)) {
           list.push({
@@ -600,8 +619,17 @@ export async function fetchUsersFromFirestore(): Promise<any[]> {
     };
     const result = await withTimeout(fetchPromise(), 10000);
     return result || [];
-  } catch (err) {
-    console.warn('Firestore fetchUsers error:', err);
+  } catch (err: any) {
+    const isPerm =
+      err?.code === 7 ||
+      err?.code === 'permission-denied' ||
+      String(err?.message || '').includes('PERMISSION_DENIED') ||
+      String(err?.message || '').includes('Missing or insufficient permissions');
+    if (isPerm) {
+      console.info('[serverFirestore] Users collection read restricted by cloud IAM credentials, continuing with local state.');
+    } else {
+      console.info('[serverFirestore] Users collection query notice:', err?.message || String(err));
+    }
     return [];
   }
 }
@@ -615,17 +643,17 @@ export async function fetchUserFromFirestore(email: string, uid?: string): Promi
 
     const fetchPromise = (async () => {
       if (uid) {
-        const snapUid = await db.collection('users').doc(uid).get();
-        if (snapUid.exists) return snapUid.data();
+        const snapUid = await db.collection('users').doc(uid).get().catch(() => null);
+        if (snapUid && snapUid.exists) return snapUid.data();
       }
       if (cleanDocId) {
-        const snapEmail = await db.collection('users').doc(cleanDocId).get();
-        if (snapEmail.exists) return snapEmail.data();
+        const snapEmail = await db.collection('users').doc(cleanDocId).get().catch(() => null);
+        if (snapEmail && snapEmail.exists) return snapEmail.data();
       }
       if (cleanEmail) {
         try {
-          const qSnap = await db.collection('users').where('email', '==', cleanEmail).get();
-          if (!qSnap.empty) {
+          const qSnap = await db.collection('users').where('email', '==', cleanEmail).get().catch(() => null);
+          if (qSnap && !qSnap.empty) {
             return qSnap.docs[0].data();
           }
         } catch {}
@@ -633,8 +661,14 @@ export async function fetchUserFromFirestore(email: string, uid?: string): Promi
       return null;
     })();
     return await withTimeout(fetchPromise, 8000);
-  } catch (err) {
-    console.warn('Firestore fetchUser error:', err);
+  } catch (err: any) {
+    const isPerm =
+      err?.code === 7 ||
+      err?.code === 'permission-denied' ||
+      String(err?.message || '').includes('PERMISSION_DENIED');
+    if (!isPerm) {
+      console.info('[serverFirestore] fetchUser notice:', err?.message || String(err));
+    }
     return null;
   }
 }
