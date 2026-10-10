@@ -176,7 +176,14 @@ export async function fetchPublicNativeFriendsFromFirestore(): Promise<{
     console.warn('[useNativeFriends] Backend /api/tutors fetch notice:', err);
   }
 
-  // 2. Direct Firestore synchronization when authenticated
+  // 2. Direct Firestore synchronization ONLY when authenticated.
+  // For unauthenticated visitors, utilize exclusively authorized server REST API (/api/tutors) above.
+  if (!auth.currentUser && typeof (auth as any)?.authStateReady === 'function') {
+    try {
+      await (auth as any).authStateReady();
+    } catch {}
+  }
+
   if (auth.currentUser) {
     const dbs = getAllFirestoreDbs();
     for (const dbInstance of dbs) {
@@ -335,40 +342,23 @@ export function useNativeFriends(options: UseNativeFriendsOptions = {}) {
         if (isMounted) setIsLoading(false);
       });
 
-    // Attach real-time listeners across all databases
+    // Attach real-time listeners across all databases strictly for authenticated sessions
     const unsubs: Array<() => void> = [];
+    const realtimeUnsubs: Array<() => void> = [];
 
-    // Re-fetch and synchronize when authentication state transitions
-    const unsubAuth = onAuthStateChanged(auth, (user) => {
-      if (user && isMounted) {
-        fetchPublicNativeFriendsFromFirestore().then(({ allTutors }) => {
-          if (!isMounted || allTutors.length === 0) return;
-          setTutors((prev) => {
-            const map = new Map<string, NativeFriendTutor>();
-            prev.forEach((t) => map.set((t.email || t.id).toLowerCase().trim(), t));
-            allTutors.forEach((t) => {
-              const k = (t.email || t.id).toLowerCase().trim();
-              const existing = map.get(k);
-              const approved = isTutorApproved(t) || (existing && isTutorApproved(existing));
-              map.set(k, {
-                ...existing,
-                ...t,
-                isApproved: approved,
-                approvalStatus: approved ? 'approved' : t.approvalStatus,
-                status: approved ? 'approved' : t.status,
-              });
-            });
-            return Array.from(map.values());
-          });
-        });
+    const cleanupRealtime = () => {
+      while (realtimeUnsubs.length > 0) {
+        try {
+          realtimeUnsubs.pop()?.();
+        } catch {}
       }
-    });
-    unsubs.push(unsubAuth);
+    };
 
-    // Only subscribe to Firestore listeners if user is authenticated
-    if (auth.currentUser) {
+    const attachRealtimeListeners = () => {
+      cleanupRealtime();
+      if (!auth.currentUser) return;
+
       const dbs = getAllFirestoreDbs();
-
       dbs.forEach((dbInstance) => {
         try {
           const teachersQuery = query(collection(dbInstance, 'users'), where('role', '==', 'teacher'));
@@ -405,7 +395,7 @@ export function useNativeFriends(options: UseNativeFriendsOptions = {}) {
               handleFirestoreError(err, OperationType.GET, 'users');
             }
           );
-          unsubs.push(unsubUsers);
+          realtimeUnsubs.push(unsubUsers);
         } catch (err) {
           console.warn('[useNativeFriends] Realtime users listener notice:', err);
         }
@@ -444,15 +434,47 @@ export function useNativeFriends(options: UseNativeFriendsOptions = {}) {
               handleFirestoreError(err, OperationType.GET, 'tutors');
             }
           );
-          unsubs.push(unsubTutors);
+          realtimeUnsubs.push(unsubTutors);
         } catch (err) {
           console.warn('[useNativeFriends] Realtime tutors listener notice:', err);
         }
       });
-    }
+    };
+
+    // Re-fetch and synchronize when authentication state transitions
+    const unsubAuth = onAuthStateChanged(auth, (user) => {
+      if (user && isMounted) {
+        fetchPublicNativeFriendsFromFirestore().then(({ allTutors }) => {
+          if (!isMounted || allTutors.length === 0) return;
+          setTutors((prev) => {
+            const map = new Map<string, NativeFriendTutor>();
+            prev.forEach((t) => map.set((t.email || t.id).toLowerCase().trim(), t));
+            allTutors.forEach((t) => {
+              const k = (t.email || t.id).toLowerCase().trim();
+              const existing = map.get(k);
+              const approved = isTutorApproved(t) || (existing && isTutorApproved(existing));
+              map.set(k, {
+                ...existing,
+                ...t,
+                isApproved: approved,
+                approvalStatus: approved ? 'approved' : t.approvalStatus,
+                status: approved ? 'approved' : t.status,
+              });
+            });
+            return Array.from(map.values());
+          });
+        });
+        attachRealtimeListeners();
+      } else {
+        // Visitor/unauthenticated state: ensure direct Firestore listeners are inactive
+        cleanupRealtime();
+      }
+    });
+    unsubs.push(unsubAuth);
 
     return () => {
       isMounted = false;
+      cleanupRealtime();
       unsubs.forEach((u) => {
         try {
           u();

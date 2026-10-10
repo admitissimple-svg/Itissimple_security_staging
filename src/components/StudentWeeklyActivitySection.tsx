@@ -27,6 +27,7 @@ import {
 import { Translations, getTranslations } from '../utils/i18n';
 import { DAYS_OF_WEEK, getTodayDayOfWeek } from '../utils/notifications';
 import { getDailyMemorizationSchedule } from '../utils/homeworkGenerator';
+import { onAuthStateChanged } from 'firebase/auth';
 import { auth } from '../firebase';
 import { getAccessToken } from '../utils/auth';
 import {
@@ -348,8 +349,10 @@ export const StudentWeeklyActivitySection: React.FC<StudentWeeklyActivitySection
     }
 
     // Also fetch target from endpoint with protected Firebase Auth & explicit week
+    let unsubAuthSession: (() => void) | null = null;
     if (activeWeekCycle !== null && activeWeekId) {
-      getAccessToken().then((token) => {
+      const executeProtectedFetch = async () => {
+        const token = await getAccessToken();
         if (!isMounted || !token) return;
 
         const canonicalUid = auth.currentUser?.uid || (isValidCanonicalUid(studentUid) ? studentUid : '');
@@ -383,12 +386,23 @@ export const StudentWeeklyActivitySection: React.FC<StudentWeeklyActivitySection
           .catch((err) => {
             console.warn('Error loading weekly checks from server:', err);
           });
-      }).catch(() => {});
+      };
+
+      // Trigger fetch once auth resolution completes
+      executeProtectedFetch();
+
+      // Ensure immediate sync when user logs in
+      unsubAuthSession = onAuthStateChanged(auth, (user) => {
+        if (user && isMounted) {
+          executeProtectedFetch();
+        }
+      });
     }
 
     return () => {
       isMounted = false;
       if (unsubWeekly) unsubWeekly();
+      if (unsubAuthSession) unsubAuthSession();
     };
   }, [studentEmail, studentUid, activeWeekCycle, activeWeekId, propWeeklyChecks]);
 

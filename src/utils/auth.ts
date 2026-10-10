@@ -5,6 +5,7 @@ import {
   signOut as firebaseAuthSignOut,
   GoogleAuthProvider,
   User,
+  onAuthStateChanged,
 } from 'firebase/auth';
 import { auth, googleAuthProvider } from '../firebase';
 
@@ -80,20 +81,47 @@ export async function requestGoogleDriveAuth(hintEmail?: string): Promise<string
   }
 }
 
-export async function getAccessToken(forceRefresh = false): Promise<string | null> {
-  if (!auth.currentUser && typeof (auth as any)?.authStateReady === 'function') {
+/**
+ * Resolves the authenticated Firebase User once auth state has completed initialization.
+ * Returns null for unauthenticated visitors without hanging indefinitely.
+ */
+export async function waitForAuthUser(): Promise<User | null> {
+  if (auth.currentUser) {
+    return auth.currentUser;
+  }
+  if (typeof (auth as any)?.authStateReady === 'function') {
     try {
       await (auth as any).authStateReady();
     } catch {
       // Ignore auth readiness errors
     }
+    if (auth.currentUser) {
+      return auth.currentUser;
+    }
   }
-  if (auth.currentUser) {
+  return new Promise<User | null>((resolve) => {
+    let unsub: (() => void) | null = null;
+    const timer = setTimeout(() => {
+      if (unsub) unsub();
+      resolve(auth.currentUser || null);
+    }, 1200);
+
+    unsub = onAuthStateChanged(auth, (user) => {
+      clearTimeout(timer);
+      if (unsub) unsub();
+      resolve(user || null);
+    });
+  });
+}
+
+export async function getAccessToken(forceRefresh = false): Promise<string | null> {
+  const user = await waitForAuthUser();
+  if (user) {
     try {
-      inMemoryToken = await auth.currentUser.getIdToken(forceRefresh);
+      inMemoryToken = await user.getIdToken(forceRefresh);
     } catch {
       try {
-        inMemoryToken = await auth.currentUser.getIdToken(true);
+        inMemoryToken = await user.getIdToken(true);
       } catch {
         // Fallback to cached inMemoryToken
       }

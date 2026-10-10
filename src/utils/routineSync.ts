@@ -1,4 +1,5 @@
 import { doc, setDoc, onSnapshot, getDoc } from 'firebase/firestore';
+import { onAuthStateChanged } from 'firebase/auth';
 import { getDb, auth } from '../firebase';
 import { DayOfWeek, TeacherOverrideTrack } from '../types';
 import { getSpotifyEmbedUrl } from './spotify';
@@ -182,6 +183,25 @@ export async function syncStudentSpotifyTrackToFirestore(
     ...(extra?.nativeFriendEmail ? { nativeFriendEmail: extra.nativeFriendEmail } : {}),
   };
 
+  // 1. Mirror to authorized server backend REST endpoint for safe public delivery
+  fetch('/api/routines/current-routine', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  }).catch(() => {});
+
+  // For unauthenticated visitors, utilize exclusively authorized server REST API above
+  if (!auth.currentUser && typeof (auth as any)?.authStateReady === 'function') {
+    try {
+      await (auth as any).authStateReady();
+    } catch {}
+  }
+
+  if (!auth.currentUser) {
+    lastSyncedSignatureMap.set(`${cleanStudentUid}:${safeWeekId}`, trackSignature);
+    return true;
+  }
+
   try {
     const db = getDb();
 
@@ -228,13 +248,6 @@ export async function syncStudentSpotifyTrackToFirestore(
         extra?.nativeFriendUid
       ).catch(() => {});
     }
-
-    // Also notify server backend mirror for fallback/REST synchronization
-    fetch('/api/routines/current-routine', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    }).catch(() => {});
 
     return true;
   } catch (error) {
@@ -324,90 +337,113 @@ export function subscribeStudentCurrentRoutine(
     })
     .catch(() => {});
 
-  const unsubscribers: (() => void)[] = [];
+  const firestoreUnsubs: (() => void)[] = [];
 
-  try {
-    const db = getDb();
+  const cleanupFirestore = () => {
+    while (firestoreUnsubs.length > 0) {
+      try {
+        firestoreUnsubs.pop()?.();
+      } catch {}
+    }
+  };
 
-    // 1. Listen to users/{studentUID}/currentRoutine/weekData (Primary)
-    const weekDataRef = doc(db, 'users', cleanStudentUid, 'currentRoutine', 'weekData');
-    const unsubWeekData = onSnapshot(
-      weekDataRef,
-      (snap) => {
-        if (snap.exists()) {
-          weekDataState = snap.data() as StudentCurrentRoutineDoc;
-        } else {
-          weekDataState = null;
-        }
-        emitMerged();
-      },
-      (err) => {
-        handleFirestoreError(err, OperationType.GET, `users/${cleanStudentUid}/currentRoutine/weekData`);
-      }
-    );
-    unsubscribers.push(unsubWeekData);
+  const attachFirestoreListeners = () => {
+    cleanupFirestore();
+    if (!auth.currentUser) return;
 
-    // 2. Listen to users/{studentUID}/currentRoutine/{weekId}
-    const cycleRef = doc(db, 'users', cleanStudentUid, 'currentRoutine', safeWeekId);
-    const unsubCycle = onSnapshot(
-      cycleRef,
-      (snap) => {
-        if (snap.exists()) {
-          cycleDataState = snap.data() as StudentCurrentRoutineDoc;
-        } else {
-          cycleDataState = null;
-        }
-        emitMerged();
-      },
-      (err) => {
-        handleFirestoreError(err, OperationType.GET, `users/${cleanStudentUid}/currentRoutine/${safeWeekId}`);
-      }
-    );
-    unsubscribers.push(unsubCycle);
+    try {
+      const db = getDb();
 
-    // If safeWeekId is week-1, also check week-5 where active cycle data lives
-    if (safeWeekId !== 'week-5') {
-      const week5Ref = doc(db, 'users', cleanStudentUid, 'currentRoutine', 'week-5');
-      const unsubWeek5 = onSnapshot(
-        week5Ref,
+      // 1. Listen to users/{studentUID}/currentRoutine/weekData (Primary)
+      const weekDataRef = doc(db, 'users', cleanStudentUid, 'currentRoutine', 'weekData');
+      const unsubWeekData = onSnapshot(
+        weekDataRef,
         (snap) => {
           if (snap.exists()) {
-            week5DataState = snap.data() as StudentCurrentRoutineDoc;
-            emitMerged();
+            weekDataState = snap.data() as StudentCurrentRoutineDoc;
+          } else {
+            weekDataState = null;
           }
+          emitMerged();
         },
-        () => {}
+        (err) => {
+          handleFirestoreError(err, OperationType.GET, `users/${cleanStudentUid}/currentRoutine/weekData`);
+        }
       );
-      unsubscribers.push(unsubWeek5);
-    }
+      firestoreUnsubs.push(unsubWeekData);
 
-    // 3. Listen to users/{studentUID}/routines/{currentDayOfWeek}
-    if (targetDay) {
-      const dayRef = doc(db, 'users', cleanStudentUid, 'routines', targetDay);
-      const unsubDay = onSnapshot(
-        dayRef,
+      // 2. Listen to users/{studentUID}/currentRoutine/{weekId}
+      const cycleRef = doc(db, 'users', cleanStudentUid, 'currentRoutine', safeWeekId);
+      const unsubCycle = onSnapshot(
+        cycleRef,
         (snap) => {
           if (snap.exists()) {
-            dayDataState = snap.data();
-            emitMerged();
+            cycleDataState = snap.data() as StudentCurrentRoutineDoc;
+          } else {
+            cycleDataState = null;
           }
+          emitMerged();
         },
-        () => {}
+        (err) => {
+          handleFirestoreError(err, OperationType.GET, `users/${cleanStudentUid}/currentRoutine/${safeWeekId}`);
+        }
       );
-      unsubscribers.push(unsubDay);
-    }
+      firestoreUnsubs.push(unsubCycle);
 
-    return () => {
-      unsubscribers.forEach((fn) => {
-        try {
-          fn();
-        } catch {}
-      });
-    };
-  } catch (error) {
-    handleFirestoreError(error, OperationType.GET, `users/${cleanStudentUid}/currentRoutine/weekData`);
-    return () => {};
+      // If safeWeekId is week-1, also check week-5 where active cycle data lives
+      if (safeWeekId !== 'week-5') {
+        const week5Ref = doc(db, 'users', cleanStudentUid, 'currentRoutine', 'week-5');
+        const unsubWeek5 = onSnapshot(
+          week5Ref,
+          (snap) => {
+            if (snap.exists()) {
+              week5DataState = snap.data() as StudentCurrentRoutineDoc;
+              emitMerged();
+            }
+          },
+          () => {}
+        );
+        firestoreUnsubs.push(unsubWeek5);
+      }
+
+      // 3. Listen to users/{studentUID}/routines/{currentDayOfWeek}
+      if (targetDay) {
+        const dayRef = doc(db, 'users', cleanStudentUid, 'routines', targetDay);
+        const unsubDay = onSnapshot(
+          dayRef,
+          (snap) => {
+            if (snap.exists()) {
+              dayDataState = snap.data();
+              emitMerged();
+            }
+          },
+          () => {}
+        );
+        firestoreUnsubs.push(unsubDay);
+      }
+    } catch (error) {
+      handleFirestoreError(error, OperationType.GET, `users/${cleanStudentUid}/currentRoutine/weekData`);
+    }
+  };
+
+  // Only attach Firestore listeners if already authenticated
+  if (auth.currentUser) {
+    attachFirestoreListeners();
   }
+
+  // Subscribe to auth transitions: attach listeners on sign-in, cleanup on sign-out/visitor
+  const unsubAuth = onAuthStateChanged(auth, (user) => {
+    if (user) {
+      attachFirestoreListeners();
+    } else {
+      cleanupFirestore();
+    }
+  });
+
+  return () => {
+    unsubAuth();
+    cleanupFirestore();
+  };
 }
 
 /**
@@ -432,22 +468,44 @@ export async function saveNativeFriendTrackFeedback(
   if (!cleanStudentUid) return false;
   const safeWeekId = weekId || 'week-1';
 
+  const feedbackEntry: StudentTrackFeedback = {
+    ...feedback,
+    studentUid: cleanStudentUid,
+    createdAt: new Date().toISOString(),
+  };
+
+  const payload = {
+    updatedAt: new Date().toISOString(),
+    nativeFriendUid: feedback.teacherUid,
+    ...(feedback.teacherEmail ? { nativeFriendEmail: feedback.teacherEmail } : {}),
+    teacherFeedback: {
+      [feedback.dayOfWeek]: feedbackEntry,
+    },
+  };
+
+  // 1. Mirror to server backend REST endpoint
+  fetch('/api/routines/current-routine/feedback', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      studentUid: cleanStudentUid,
+      weekId: safeWeekId,
+      feedback: feedbackEntry,
+    }),
+  }).catch(() => {});
+
+  if (!auth.currentUser && typeof (auth as any)?.authStateReady === 'function') {
+    try {
+      await (auth as any).authStateReady();
+    } catch {}
+  }
+
+  if (!auth.currentUser) {
+    return true;
+  }
+
   try {
     const db = getDb();
-    const feedbackEntry: StudentTrackFeedback = {
-      ...feedback,
-      studentUid: cleanStudentUid,
-      createdAt: new Date().toISOString(),
-    };
-
-    const payload = {
-      updatedAt: new Date().toISOString(),
-      nativeFriendUid: feedback.teacherUid,
-      ...(feedback.teacherEmail ? { nativeFriendEmail: feedback.teacherEmail } : {}),
-      teacherFeedback: {
-        [feedback.dayOfWeek]: feedbackEntry,
-      },
-    };
 
     // 1. Save to users/{studentUID}/currentRoutine/weekData
     const weekDataRef = doc(db, 'users', cleanStudentUid, 'currentRoutine', 'weekData');
@@ -460,17 +518,6 @@ export async function saveNativeFriendTrackFeedback(
     // 3. Save to users/{studentUID}/routines/{dayOfWeek}
     const dayDocRef = doc(db, 'users', cleanStudentUid, 'routines', feedback.dayOfWeek);
     await setDoc(dayDocRef, { teacherFeedback: payload.teacherFeedback }, { merge: true });
-
-    // Also mirror to server backend
-    fetch('/api/routines/current-routine/feedback', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        studentUid: cleanStudentUid,
-        weekId: safeWeekId,
-        feedback: feedbackEntry,
-      }),
-    }).catch(() => {});
 
     return true;
   } catch (error) {
@@ -509,6 +556,27 @@ export async function saveTeacherSpotifyOverrideToFirestore(
     updatedAt: new Date().toISOString(),
   };
 
+  // 1. Mirror to server REST notification
+  fetch('/api/routines/override-track', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      studentUid: cleanStudentUid,
+      dayOfWeek,
+      teacherOverrideTrack: sanitizedTrack,
+    }),
+  }).catch(() => {});
+
+  if (!auth.currentUser && typeof (auth as any)?.authStateReady === 'function') {
+    try {
+      await (auth as any).authStateReady();
+    } catch {}
+  }
+
+  if (!auth.currentUser) {
+    return true;
+  }
+
   try {
     const db = getDb();
     // 1. Write to users/{studentUID}/routines/{dayOfWeek}
@@ -536,17 +604,6 @@ export async function saveTeacherSpotifyOverrideToFirestore(
       { merge: true }
     );
 
-    // 3. Optional REST notification
-    fetch('/api/routines/override-track', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        studentUid: cleanStudentUid,
-        dayOfWeek,
-        teacherOverrideTrack: sanitizedTrack,
-      }),
-    }).catch(() => {});
-
     return true;
   } catch (error) {
     handleFirestoreError(error, OperationType.WRITE, `users/${cleanStudentUid}/routines/${dayOfWeek}`);
@@ -565,9 +622,31 @@ export async function removeTeacherSpotifyOverrideFromFirestore(
   const cleanStudentUid = normalizeStudentIdForPath(studentUid);
   if (!cleanStudentUid || !dayOfWeek) return false;
 
+  const now = new Date().toISOString();
+
+  // 1. Mirror to server REST notification
+  fetch('/api/routines/override-track', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      studentUid: cleanStudentUid,
+      dayOfWeek,
+      teacherOverrideTrack: null,
+    }),
+  }).catch(() => {});
+
+  if (!auth.currentUser && typeof (auth as any)?.authStateReady === 'function') {
+    try {
+      await (auth as any).authStateReady();
+    } catch {}
+  }
+
+  if (!auth.currentUser) {
+    return true;
+  }
+
   try {
     const db = getDb();
-    const now = new Date().toISOString();
 
     const dayRef = doc(db, 'users', cleanStudentUid, 'routines', dayOfWeek);
     await setDoc(
@@ -590,16 +669,6 @@ export async function removeTeacherSpotifyOverrideFromFirestore(
       },
       { merge: true }
     );
-
-    fetch('/api/routines/override-track', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        studentUid: cleanStudentUid,
-        dayOfWeek,
-        teacherOverrideTrack: null,
-      }),
-    }).catch(() => {});
 
     return true;
   } catch (error) {
