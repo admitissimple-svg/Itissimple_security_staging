@@ -8,7 +8,7 @@ import fs from 'fs';
 import path from 'path';
 
 export const GOOGLE_DRIVE_SESSION_FOLDER = "It's Simple - Session Notes";
-export const ACTIVE_GOOGLE_CLOUD_PROJECT_ID = 'itissimple-8663d';
+export const ACTIVE_GOOGLE_CLOUD_PROJECT_ID = 'itissimple-security-staging';
 
 export interface PlatformDriveSyncParams {
   studentName?: string;

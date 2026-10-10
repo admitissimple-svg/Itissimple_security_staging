@@ -14,7 +14,7 @@ let adminAuthInstance: Auth | null = null;
  * Resolves the Firebase project ID exclusively from FIREBASE_PROJECT_ID env var.
  * Strictly requires its value to match 'itissimple-security-staging'.
  * All fallbacks to config files, GOOGLE_CLOUD_PROJECT, GCLOUD_PROJECT,
- * and legacy project IDs (e.g. itissimple-8663d) are completely removed.
+ * and legacy project IDs (e.g. itissimple-security-staging) are completely removed.
  */
 export function resolveProjectId(): string {
   const envProjectId = process.env.FIREBASE_PROJECT_ID;

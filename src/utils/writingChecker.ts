@@ -1,6 +1,6 @@
 import { EnglishLevel, WritingEvaluationResult, WordFeedback, SentenceFeedback, WeeklyHomeworkData, HomeworkAiEvaluation } from '../types';
 
-export const GEMINI_PROJECT_ID = 'itissimple-8663d';
+export const GEMINI_PROJECT_ID = 'itissimple-security-staging';
 
 const DAILY_SENTENCE_CACHE_VERSION = 'v3';
 
@@ -777,7 +777,7 @@ export function analyzeSentenceGrammarDeterministic(
 /**
  * Dedicated, standalone AI handler strictly for the "Sentence of the Day" component.
  * Sends only the necessary payload (user sentence and target daily vocabulary words)
- * to the isolated Gemini API endpoint using project `itissimple-8663d`.
+ * to the isolated Gemini API endpoint using project `itissimple-security-staging`.
  */
 export async function checkDailySentenceAi(
   sentence: string,

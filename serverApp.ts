@@ -82,7 +82,7 @@ import {
 const rawEnvModel = (process.env.GEMINI_MODEL || '').trim();
 const isInvalidEnvModel = !rawEnvModel || rawEnvModel.includes('1.5') || rawEnvModel.includes('2.0') || rawEnvModel.startsWith('emini');
 const GEMINI_TEXT_MODEL = isInvalidEnvModel ? 'gemini-3.6-flash' : rawEnvModel;
-const ACTIVE_FIREBASE_PROJECT_ID = 'itissimple-8663d';
+const ACTIVE_FIREBASE_PROJECT_ID = 'itissimple-security-staging';
 const GEMINI_PROJECT_ID = ACTIVE_FIREBASE_PROJECT_ID;
 
 const app = express();
@@ -11397,7 +11397,7 @@ app.post('/api/email-logs', (req, res) => {
   res.json({ success: true });
 });
 
-// 12a. Isolated, Token-Optimized AI Handler Strictly for "Sentence of the Day" (Project: itissimple-8663d)
+// 12a. Isolated, Token-Optimized AI Handler Strictly for "Sentence of the Day" (Project: itissimple-security-staging)
 const dailySentenceEvaluationCache = new Map<string, { data: any; expiry: number }>();
 
 async function evaluateDailySentenceIsolated(

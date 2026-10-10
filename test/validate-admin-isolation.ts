@@ -84,8 +84,8 @@ async function runTests() {
       resetFirebaseAdminForTesting();
       delete process.env.FIREBASE_PROJECT_ID;
       // Definir variáveis legadas para garantir que NÃO há fallback
-      process.env.GOOGLE_CLOUD_PROJECT = 'itissimple-8663d';
-      process.env.GCLOUD_PROJECT = 'itissimple-8663d';
+      process.env.GOOGLE_CLOUD_PROJECT = '';
+      process.env.GCLOUD_PROJECT = 'itissimple-security-staging';
 
       let resolveError: Error | null = null;
       try {
@@ -115,7 +115,7 @@ async function runTests() {
     }
 
     // ---------------------------------------------------------
-    // Cenário 3: Project ID antigo (itissimple-8663d)
+    // Cenário 3: Project ID antigo (itissimple-security-staging)
     // ---------------------------------------------------------
     console.log('\n--- 3. Testando Project ID antigo (itissimple-8663d bloqueado) ---');
     {
@@ -185,7 +185,7 @@ async function runTests() {
     {
       // 5.1 Instância em cache pertencente ao projeto antigo itissimple-8663d
       resetFirebaseAdminForTesting();
-      process.env.FIREBASE_PROJECT_ID = 'itissimple-security-staging';
+      process.env.FIREBASE_PROJECT_ID = 'itissimple-8663d';
 
       const mockLegacyApp: App = {
         name: '[DEFAULT]',
